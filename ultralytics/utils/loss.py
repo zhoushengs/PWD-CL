@@ -876,7 +876,7 @@ class v8DetectionLoss:
 class v8MoCoDetectionLoss(v8DetectionLoss):
     """结合对象级MoCo对比学习的YOLO检测损失"""
 
-    def __init__(self, model, tal_topk=10, contrastive_weight=1):
+    def __init__(self, model, tal_topk=10, contrastive_weight=0.5):
         """
         初始化 v8MoCoDetectionLoss。
         Args:
@@ -887,6 +887,8 @@ class v8MoCoDetectionLoss(v8DetectionLoss):
         super().__init__(model, tal_topk=tal_topk)
         self.contrastive_weight = contrastive_weight
         self.contrastive_loss_fn = nn.CrossEntropyLoss()  # 对比损失函数
+        self.moco_start_epoch = int(getattr(self.hyp, "moco_start_epoch", 20))
+        self.moco_ramp_epochs = max(int(getattr(self.hyp, "moco_ramp_epochs", 10)), 0)
 
     def __call__(self, preds, batch):
         """
@@ -907,13 +909,21 @@ class v8MoCoDetectionLoss(v8DetectionLoss):
 
             # 2. 计算对比损失
             cl_loss = torch.tensor(0.0, device=self.device)  # 初始化对比损失
-            if query_features is not None and key_features is not None and object_labels is not None:
+            contrastive_scale = 1.0
+            if epoch is not None:
+                if epoch < self.moco_start_epoch:
+                    contrastive_scale = 0.0
+                elif self.moco_ramp_epochs > 0:
+                    contrastive_scale = min((epoch - self.moco_start_epoch + 1) / self.moco_ramp_epochs, 1.0)
+
+            if contrastive_scale > 0 and query_features is not None and key_features is not None and object_labels is not None:
                 if query_features.shape[0] > 1:  # 至少需要两个对象特征
                     # 计算对比损失
                     cl_loss = self._compute_contrastive_loss(query_features, key_features, object_labels, queue_snapshot)
+                    #cl_loss = cl_loss * contrastive_scale
 
             # 3. 合并损失
-            total_loss = det_loss + self.contrastive_weight * cl_loss
+            total_loss = det_loss + self.contrastive_weight * cl_loss* contrastive_scale
 
             # 4. 返回损失和详细信息
             loss_items = torch.cat([det_loss_items, cl_loss.detach().unsqueeze(0)])
@@ -958,6 +968,7 @@ class v8MoCoDetectionLoss(v8DetectionLoss):
         # 4. 构造同 batch 正样本掩码（同类别且非自身）
         labels = object_labels.to(device).view(-1, 1)   # [N,1]
         pos_mask = labels.eq(labels.t()).float()   
+        batch_neg_mask = 1 - pos_mask 
         # raw_mask = labels.eq(labels.t())                # [N, N]
         # 统计每行同类样本数
         # pos_counts = raw_mask.sum(1)                    # [N]
@@ -980,7 +991,7 @@ class v8MoCoDetectionLoss(v8DetectionLoss):
 
         pos_sum = (exp_kk * pos_mask).sum(1)  
 
-        batch_neg_mask = 1 - pos_mask 
+        
         batch_neg_sum = (exp_kk * batch_neg_mask).sum(1)  # [N, N]
         queue_labels = torch.arange(C, device=device).unsqueeze(1).repeat(1, Qsize).view(-1)  # [M]
         # neg_mask[i,j]=True 当 queue_labels[j]!=object_labels[i]
@@ -990,9 +1001,16 @@ class v8MoCoDetectionLoss(v8DetectionLoss):
 
         # 6. 计算 InfoNCE 损失：−log(pos / (pos + neg))
         eps = 1e-8
+        alpha = 1.5
+        beta = 0.999
+
         loss = -torch.log((pos_sum + eps) / (pos_sum + neg_sum + eps))
         unique_labels, counts = torch.unique(object_labels, return_counts=True)
         weights_tensor = 1.0 / (counts.float() + 1e-8)
+        weights_tensor =  1.0 / torch.log(alpha + counts.float())
+        # effective_num = 1.0 - torch.pow(beta, counts.float())
+        # weights = (1.0 - beta) / effective_num
+        # weights_tensor =  weights / weights.sum() * len(unique_labels)
         sample_weight = torch.zeros_like(object_labels, dtype=torch.float, device=device)
         for label, w in zip(unique_labels, weights_tensor):
             sample_weight[object_labels == label] = w
@@ -1029,6 +1047,55 @@ class v8MoCoDetectionLoss(v8DetectionLoss):
         eps = 1e-8
         loss_per_sample = -torch.log((pos_exp + eps) / (all_exp + eps))   # [N]
         return loss_per_sample.mean()
+    
+    def _stable_moco_contrastive_loss(self, query_features, key_features, object_labels, queue_snapshot):
+        """Compute a stable supervised contrastive loss using batch and queue positives."""
+        device = query_features.device
+        q = F.normalize(query_features.to(device), dim=1)
+        k = F.normalize(key_features.to(device), dim=1).detach()
+        labels = object_labels.to(device).view(-1)
+        n, d = q.shape
+
+        if n <= 1:
+            return torch.tensor(0.0, device=device)
+
+        c, qsize, _ = queue_snapshot.shape
+        queue_feats = F.normalize(queue_snapshot.to(device).view(c * qsize, d), dim=1)
+        queue_labels = torch.arange(c, device=device).unsqueeze(1).repeat(1, qsize).view(-1)
+
+        temp = max(float(getattr(self.hyp, "temperature", 0.1)), 1e-6)
+        logits_batch = torch.matmul(q, k.t()) / temp
+        logits_queue = torch.matmul(q, queue_feats.t()) / temp
+
+        pos_mask_batch = labels.view(-1, 1).eq(labels.view(1, -1))
+        pos_mask_batch.fill_diagonal_(False)
+        pos_mask_queue = labels.view(-1, 1).eq(queue_labels.view(1, -1))
+        valid_mask = pos_mask_batch.any(dim=1) | pos_mask_queue.any(dim=1)
+
+        if not valid_mask.any():
+            return torch.tensor(0.0, device=device)
+
+        logits = torch.cat([logits_batch, logits_queue], dim=1)
+        pos_mask = torch.cat([pos_mask_batch, pos_mask_queue], dim=1).float()
+        logits = logits - logits.max(dim=1, keepdim=True).values.detach()
+        exp_logits = torch.exp(logits)
+
+        pos_exp = (exp_logits * pos_mask).sum(dim=1)
+        all_exp = exp_logits.sum(dim=1)
+        eps = 1e-8
+        loss = -torch.log((pos_exp + eps) / (all_exp + eps))
+        loss = loss[valid_mask]
+        valid_labels = labels[valid_mask]
+
+        unique_labels, counts = torch.unique(valid_labels, return_counts=True)
+        sample_weight = torch.ones_like(valid_labels, dtype=torch.float, device=device)
+        for label, count in zip(unique_labels, counts.float()):
+            sample_weight[valid_labels == label] = 1.0 / (count + eps)
+
+        return (loss * sample_weight).sum() / (sample_weight.sum() + eps)
+
+
+v8MoCoDetectionLoss._compute_contrastive_loss = _stable_moco_contrastive_loss
 
 class v8SegmentationLoss(v8DetectionLoss):
     """Criterion class for computing training losses."""

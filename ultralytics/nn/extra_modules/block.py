@@ -16,9 +16,79 @@ import torch.nn.functional as F
 
 __all__ = ['PatchEmbed',
            'WTConv2d',
-           'C2f_WTConv', 'HWD', 'C2f_MambaOut','C2f_EA']
+           'C2f_WTConv', 'HWD', 'C2f_MambaOut','C2f_EA','C2f_RVB']
+
+class Residual(nn.Module):
+    def __init__(self, fn):
+        super(Residual, self).__init__()
+        self.fn = fn
+
+    def forward(self, x):
+        return self.fn(x) + x
+
+class Conv2d_BN(torch.nn.Sequential):
+    def __init__(self, a, b, ks=1, stride=1, pad=0, dilation=1,
+                 groups=1, bn_weight_init=1, resolution=-10000):
+        super().__init__()
+        self.add_module('c', torch.nn.Conv2d(
+            a, b, ks, stride, pad, dilation, groups, bias=False))
+        self.add_module('bn', torch.nn.BatchNorm2d(b))
+        torch.nn.init.constant_(self.bn.weight, bn_weight_init)
+        torch.nn.init.constant_(self.bn.bias, 0)
+
+    @torch.no_grad()
+    def fuse_self(self):
+        c, bn = self._modules.values()
+        w = bn.weight / (bn.running_var + bn.eps)**0.5
+        w = c.weight * w[:, None, None, None]
+        b = bn.bias - bn.running_mean * bn.weight / \
+            (bn.running_var + bn.eps)**0.5
+        m = torch.nn.Conv2d(w.size(1) * self.c.groups, w.size(
+            0), w.shape[2:], stride=self.c.stride, padding=self.c.padding, dilation=self.c.dilation, groups=self.c.groups,
+            device=c.weight.device)
+        m.weight.data.copy_(w)
+        m.bias.data.copy_(b)
+        return m
+
+######################################## RepViT start ########################################
+
+class RepViTBlock(nn.Module):
+    def __init__(self, inp, oup, use_se=True):
+        super(RepViTBlock, self).__init__()
+
+        self.identity = inp == oup
+        hidden_dim = 2 * inp
+
+        self.token_mixer = nn.Sequential(
+            RepVGGDW(inp),
+            SqueezeExcite(inp, 0.25) if use_se else nn.Identity(),
+        )
+        self.channel_mixer = Residual(nn.Sequential(
+                # pw
+                Conv2d_BN(inp, hidden_dim, 1, 1, 0),
+                nn.GELU(),
+                # pw-linear
+                Conv2d_BN(hidden_dim, oup, 1, 1, 0, bn_weight_init=0),
+            ))
+
+    def forward(self, x):
+        return self.channel_mixer(self.token_mixer(x))
+
+class RepViTBlock_EMA(RepViTBlock):
+    def __init__(self, inp, oup, use_se=True):
+        super().__init__(inp, oup, use_se)
+        
+        self.token_mixer = nn.Sequential(
+            RepVGGDW(inp),
+            EMA(inp) if use_se else nn.Identity(),
+        )
 
 
+
+class C2f_RVB(C2f):
+    def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5):
+        super().__init__(c1, c2, n, shortcut, g, e)
+        self.m = nn.ModuleList(RepViTBlock(self.c, self.c, False) for _ in range(n))
 ######################################## CVPR2025 MambaOut start ########################################
 
 class C2f_MambaOut(C2f):

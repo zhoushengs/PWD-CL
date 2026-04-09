@@ -244,6 +244,7 @@ class BaseTrainer:
             else []
         )
         always_freeze_names = [".dfl",".key_encoder"]  # always freeze these layers
+        #always_freeze_names = [".key_encoder"] 
         freeze_layer_names = [f"model.{x}." for x in freeze_list] + always_freeze_names
         for k, v in self.model.named_parameters():
             # v.register_hook(lambda x: torch.nan_to_num(x))  # NaN to 0 (commented for erratic training results)
@@ -380,8 +381,14 @@ class BaseTrainer:
 
                 # Forward
                 with autocast(self.amp):
-                    batch = self.preprocess_batch(batch)
+                    batch = self.preprocess_batch(batch) 
+                    #print(self.model(batch,epoch=self.epoch,dir=self.save_dir))
+                    #print(self.epoch)
                     self.loss, self.loss_items = self.model(batch,epoch=self.epoch,dir=self.save_dir)
+                    #result = self.model(batch, epoch=self.epoch, dir=self.save_dir)
+                    #print("debug model return:", result)
+                    #self.loss, self.loss_items = result
+
                     if RANK != -1:
                         self.loss *= world_size
                     self.tloss = (
@@ -568,7 +575,7 @@ class BaseTrainer:
                 if "yaml_file" in data:
                     self.args.data = data["yaml_file"]  # for validating 'yolo train data=url.zip' usage
         except Exception as e:
-            raise RuntimeError(emojis(f"Dataset '{clean_url(self.args.data)}' error ❌ {e}")) from e
+            raise RuntimeError(emojis(f"Dataset '{clean_url(self.args.data)}' error ?{e}")) from e
         self.data = data
         return data["train"], data.get("val"), data.get("test") or data.get("val")
 

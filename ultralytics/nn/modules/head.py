@@ -175,8 +175,80 @@ class Detect(nn.Module):
 from torchvision.ops import roi_align
 import torch.nn.functional as F
 
+class EncoderWithProjector(nn.Module):
+    def __init__(self, in_c, feat_dim, hidden_dim):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Conv2d(in_c, in_c, kernel_size=3, padding=1, groups=in_c, bias=False),
+            nn.BatchNorm2d(in_c),
+            nn.ReLU(),
+            nn.Conv2d(in_c, feat_dim, kernel_size=1, bias=False),
+            nn.BatchNorm2d(feat_dim),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool2d((1, 1)),
+            nn.Flatten(),
+        )
+
+        self.projector = nn.Sequential(
+            nn.Linear(feat_dim, feat_dim, bias=False),
+            # nn.BatchNorm1d(hidden_dim),
+            # nn.ReLU(),
+            # nn.Dropout(p=0.2),
+            # nn.Linear(hidden_dim, feat_dim, bias=True),
+        )
+
+    def forward(self, x):
+        feat = self.encoder(x)               # 未 normalize
+        z = self.projector(feat)             # 未 normalize
+        #z = F.normalize(z, dim=1)            # contrastive 需要
+        return z
+    
+class ExternalAttention(nn.Module):
+    def __init__(self, d_model, S=64):
+        super().__init__()
+        self.mk = nn.Linear(d_model, S, bias=False)
+        self.mv = nn.Linear(S, d_model, bias=False)
+        self.softmax = nn.Softmax(dim=1)
+
+    def forward(self, x):
+        attn = self.mk(x)                          # [B, S]
+        attn = self.softmax(attn)                  # normalize
+        out = self.mv(attn)                        # [B, D]
+        return out
+class EncoderWithProjectorEA(nn.Module):
+    def __init__(self, in_c, feat_dim, hidden_dim=64):
+        super().__init__()
+
+        # Encoder 和你原来一样
+        self.encoder = nn.Sequential(
+            nn.Conv2d(in_c, in_c, kernel_size=3, padding=1, groups=in_c, bias=False),
+            nn.BatchNorm2d(in_c),
+            nn.ReLU(),
+
+            nn.Conv2d(in_c, feat_dim, kernel_size=1, bias=False),
+            nn.BatchNorm2d(feat_dim),
+            nn.ReLU(),
+
+            nn.AdaptiveAvgPool2d((1, 1)),
+            nn.Flatten(),
+        )
+
+        # External Attention + 线性层作为 projector
+        self.projector = nn.Sequential(
+            ExternalAttention(feat_dim, S=hidden_dim),
+            #nn.Linear(feat_dim, feat_dim, bias=False)
+        )
+
+    def forward(self, x):
+        feat = self.encoder(x)
+        z = self.projector(feat)
+        z = F.normalize(z, dim=1)    # contrastive 推荐加
+        return z
+
+
+
 class DetectWithObjectMoCo(Detect):
-    def __init__(self, nc=80, ch=(), queue_size=128, momentum=0.999, feature_dim=64, roi_output_size=9):
+    def __init__(self, nc=80, ch=(), queue_size=8192*2, momentum=0.999, feature_dim=128, roi_output_size=7):
         """
         Detection head with MoCo for object-level contrastive learning.
         Args:
@@ -209,32 +281,37 @@ class DetectWithObjectMoCo(Detect):
         self.dim_map = nn.Sequential(
             nn.Conv2d(feature_dim_2, c_feat_map_for_roi, kernel_size=1, bias=False),
             nn.BatchNorm2d(c_feat_map_for_roi),
-            nn.ReLU(inplace=True)
-        ) 
-        common_encoder_layers = lambda in_c: nn.Sequential(
-            # nn.Conv2d(in_c, self.feature_dim, kernel_size=3, padding=1, bias=False),
-            # nn.BatchNorm2d(self.feature_dim),
-            # nn.ReLU(inplace=True),
-            # Depthwise Convolution
-            nn.Conv2d(in_c, in_c, kernel_size=3, padding=1, groups=in_c, bias=False),
-            nn.BatchNorm2d(in_c),
-            nn.ReLU(inplace=True),
-            # Pointwise Convolution (1x1)
-            nn.Conv2d(in_c, self.feature_dim, kernel_size=1, bias=False),
-            nn.BatchNorm2d(self.feature_dim),
-            nn.ReLU(inplace=True),
-            nn.AdaptiveAvgPool2d((1, 1)),  # Output: [N, feature_dim, 1, 1]
-            nn.Flatten(),  # Output: [N, feature_dim]
-            # MoCo projection head
-            nn.Linear(self.feature_dim, self.hidden_dim, bias=False),
-            nn.BatchNorm1d(self.hidden_dim), # BN after linear for projection
-            nn.ReLU(inplace=True),
-            nn.Linear(self.hidden_dim, self.feature_dim, bias=True) # Final projection
+            nn.ReLU()
         )
-        self.query_encoder = common_encoder_layers(c_feat_map_for_roi)
-        self.key_encoder = common_encoder_layers(c_feat_map_for_roi)
+        #common_encoder_layers = EncoderWithProjector(c_feat_map_for_roi, self.feature_dim, self.hidden_dim) 
+        # common_encoder_layers = lambda in_c: nn.Sequential(
+        #     # nn.Conv2d(in_c, self.feature_dim, kernel_size=3, padding=1, bias=False),
+        #     # nn.BatchNorm2d(self.feature_dim),
+        #     # nn.ReLU(inplace=True),
+        #     # Depthwise Convolution
+        #     nn.Conv2d(in_c, in_c, kernel_size=3, padding=1, groups=in_c, bias=False),
+        #     nn.BatchNorm2d(in_c),
+        #     nn.ReLU(inplace=True),
+        #     # Pointwise Convolution (1x1)
+        #     nn.Conv2d(in_c, self.feature_dim, kernel_size=1, bias=False),
+        #     nn.BatchNorm2d(self.feature_dim),
+        #     nn.ReLU(inplace=True),
+        #     nn.AdaptiveAvgPool2d((1, 1)),  # Output: [N, feature_dim, 1, 1]
+        #     nn.Flatten(),  # Output: [N, feature_dim]
+        #     # MoCo projection head
+        #     nn.Linear(self.feature_dim, self.hidden_dim, bias=False),
+        #     nn.BatchNorm1d(self.hidden_dim), # BN after linear for projection
+        #     nn.ReLU(inplace=True),
+        #     nn.Dropout(p=0.2),
+        #     nn.Linear(self.hidden_dim, self.feature_dim, bias=True), # Final projection
+        #     nn.functional.normalize(dim=1)
+        # # )
+        # self.query_encoder = common_encoder_layers(c_feat_map_for_roi)
+        # self.key_encoder = common_encoder_layers(c_feat_map_for_roi)
+        self.query_encoder = EncoderWithProjectorEA(c_feat_map_for_roi, self.feature_dim, self.hidden_dim)
+        self.key_encoder = EncoderWithProjectorEA(c_feat_map_for_roi, self.feature_dim, self.hidden_dim)
 
-        # Initialize key_encoder with query_encoder weights and stop its gradients
+        # Initialize key_encoder with query_encoTder weights and stop its gradients
         for param_q, param_k in zip(self.query_encoder.parameters(), self.key_encoder.parameters()):
             param_k.data.copy_(param_q.data)
             param_k.requires_grad = False
@@ -309,7 +386,7 @@ class DetectWithObjectMoCo(Detect):
         current_batch_img_shapes = current_batch_img_shapes.to(device)
 
         H_img, W_img = current_batch_img_shapes[0].item(), current_batch_img_shapes[1].item()
-        # bboxes_abs_img_scale * [W,H,W,H] �?像素xywh
+        # bboxes_abs_img_scale * [W,H,W,H] �?像素xywh
         scale_img = torch.tensor([W_img, H_img, W_img, H_img],
                                  device=device, dtype=bboxes_abs_img_scale.dtype)
         pixel_xywh = bboxes_abs_img_scale * scale_img  # [N,4]
@@ -366,9 +443,9 @@ class DetectWithObjectMoCo(Detect):
         #encoded_features2 = encoder(self.dim_map(patches2))  # Expected output: [N_roi, self.feature_dim]
 
         # L2 Normalize the encoded features
-        normalized_features = F.normalize(encoded_features, p=2, dim=1)
+        #normalized_features = F.normalize(encoded_features, p=2, dim=1)
         #normalized_features2 = F.normalize(encoded_features2, p=2, dim=1)
-        return normalized_features
+        return encoded_features
 
     def forward(self, x_pyramid_from_neck: List[torch.Tensor], batch: dict = None):
         """

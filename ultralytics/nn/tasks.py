@@ -324,11 +324,11 @@ class BaseModel(nn.Module):
         if not hasattr(self, "criterion"):
             self.criterion = self.init_criterion()
 
-    # 前向传播，获取预测值
+    # 前向传播，获取预测�?        
         if preds is None:
-            preds = self.forward(batch["img"],batch=batch)  # 调用模型的 forward 方法
+            preds = self.forward(batch["img"],batch=batch)  # 调用模型�?forward 方法
 
-        # 检查是否是 MoCo 检测头的输出
+        # 检查是否是 MoCo 检测头的输�?        
         if isinstance(preds, tuple) and len(preds) == 6:
             # preds 包含 (det_head_outputs, raw_features, query_features, key_features, object_labels, queue_snapshot)
             det_head_outputs, raw_features, query_features, key_features, object_labels, queue_snapshot = preds
@@ -339,10 +339,10 @@ class BaseModel(nn.Module):
                 print(f"Saved query distribution to {dir}/feat_dist_epoch{epoch+1}.npz")
             # 调用 v8MoCoDetectionLoss 计算损失
             return self.criterion(
-                (det_head_outputs, raw_features, query_features, key_features, object_labels, queue_snapshot), batch
+                (det_head_outputs, raw_features, query_features, key_features, object_labels, queue_snapshot), batch, epoch=epoch
             )
 
-        # 如果不是 MoCo 检测头，使用标准检测损失
+        # 如果不是 MoCo 检测头，使用标准检测损�?        
         return self.criterion(preds, batch)
 
     def init_criterion(self):
@@ -579,7 +579,7 @@ class RTDETRDetectionModel(DetectionModel):
 
         return RTDETRDetectionLoss(nc=self.nc, use_vfl=True)
 
-    def loss(self, batch, preds=None):
+    def loss(self, batch, preds=None, epoch=None, dir=None):
         """
         Compute the loss for the given batch of data.
 
@@ -1065,7 +1065,7 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             C2fCIB,
             WGAFM,
             WGAFMdown,
-            GSConv, GSConvns, VoVGSCSP, VoVGSCSPns, VoVGSCSPC, C2f_WTConv, WTConv2d, HWD, C2f_MambaOut, C2f_EA
+            GSConv, GSConvns, VoVGSCSP, VoVGSCSPns, VoVGSCSPC, C2f_WTConv, WTConv2d, HWD, C2f_MambaOut, C2f_EA,C2f_RVB
         }:
             c1, c2 = ch[f], args[0]
             if c2 != nc:  # if c2 not equal to number of classes (i.e. for Classify() output)
@@ -1092,7 +1092,7 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
                 C2fPSA,
                 C2fCIB,
                 C2PSA,
-                VoVGSCSP, VoVGSCSPns, VoVGSCSPC,C2f_WTConv, C2f_MambaOut, C2f_EA
+                VoVGSCSP, VoVGSCSPns, VoVGSCSPC,C2f_WTConv, C2f_MambaOut, C2f_EA,C2f_RVB
             }:
                 args.insert(2, n)  # number of repeats
                 n = 1
