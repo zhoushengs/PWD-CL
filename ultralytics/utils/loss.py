@@ -890,7 +890,7 @@ class v8MoCoDetectionLoss(v8DetectionLoss):
         self.moco_start_epoch = int(getattr(self.hyp, "moco_start_epoch", 20))
         self.moco_ramp_epochs = max(int(getattr(self.hyp, "moco_ramp_epochs", 10)), 0)
 
-    def __call__(self, preds, batch):
+    def __call__(self, preds, batch, epoch=None):
         """
         计算总损失，包括检测损失和对比损失。
         Args:
@@ -1095,7 +1095,7 @@ class v8MoCoDetectionLoss(v8DetectionLoss):
         return (loss * sample_weight).sum() / (sample_weight.sum() + eps)
 
 
-v8MoCoDetectionLoss._compute_contrastive_loss = _stable_moco_contrastive_loss
+v8MoCoDetectionLoss._compute_contrastive_loss = v8MoCoDetectionLoss._stable_moco_contrastive_loss
 
 class v8SegmentationLoss(v8DetectionLoss):
     """Criterion class for computing training losses."""
