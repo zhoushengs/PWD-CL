@@ -248,7 +248,7 @@ class EncoderWithProjectorEA(nn.Module):
 
 
 class DetectWithObjectMoCo(Detect):
-    def __init__(self, nc=80, ch=(), queue_size=8192*2, momentum=0.999, feature_dim=128, roi_output_size=7):
+    def __init__(self, nc=80, ch=(), queue_size=8192*2, momentum=0.999, feature_dim=32, roi_output_size=7):
         """
         Detection head with MoCo for object-level contrastive learning.
         Args:
