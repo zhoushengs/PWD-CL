@@ -1,5 +1,10 @@
 # Ultralytics YOLO 🚀, AGPL-3.0 license
 
+import math
+import random
+from collections import deque
+from pathlib import Path
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -8,6 +13,7 @@ from ultralytics.utils.metrics import OKS_SIGMA
 from ultralytics.utils.ops import crop_mask, xywh2xyxy, xyxy2xywh
 from ultralytics.utils.tal import RotatedTaskAlignedAssigner, TaskAlignedAssigner, dist2bbox, dist2rbox, make_anchors
 from ultralytics.utils.torch_utils import autocast
+from ultralytics.utils import LOGGER
 
 from .metrics import bbox_iou, probiou
 from .tal import bbox2dist
@@ -137,6 +143,46 @@ class RotatedBboxLoss(BboxLoss):
             loss_dfl = torch.tensor(0.0).to(pred_dist.device)
 
         return loss_iou, loss_dfl
+
+
+class HardNegativeBuffer:
+    """Lightweight FIFO buffer of hard-negative sample identifiers."""
+
+    def __init__(self, max_size=10000):
+        """Initialize a fixed-size hard-negative buffer."""
+        self.max_size = max(int(max_size), 0)
+        self.queue = deque()
+        self.counts = {}
+
+    def __len__(self):
+        """Return the number of buffered entries."""
+        return len(self.queue)
+
+    def add(self, samples):
+        """Add sample identifiers and evict old entries in FIFO order."""
+        if self.max_size <= 0:
+            return
+        for sample in samples:
+            if sample is None:
+                continue
+            self.queue.append(sample)
+            self.counts[sample] = self.counts.get(sample, 0) + 1
+            while len(self.queue) > self.max_size:
+                oldest = self.queue.popleft()
+                count = self.counts.get(oldest, 0) - 1
+                if count > 0:
+                    self.counts[oldest] = count
+                else:
+                    self.counts.pop(oldest, None)
+
+    def sample(self, k):
+        """Sample up to k unique identifiers from the buffer."""
+        if k <= 0 or not self.counts:
+            return []
+        keys = list(self.counts)
+        if k >= len(keys):
+            return keys
+        return random.sample(keys, k)
 
 
 class KeypointLoss(nn.Module):
@@ -675,8 +721,6 @@ class v8CLloss:
             # pred_dist = (pred_dist.view(b, a, c // 4, 4).softmax(2) * self.proj.type(pred_dist.dtype).view(1, 1, -1, 1)).sum(2)
         return dist2bbox(pred_dist, anchor_points, xywh=False)
 
-  
-    
     def __call__(self, rp, preds, batch):
         """Calculate the sum of the loss for box, cls and dfl multiplied by batch size."""
         loss = torch.zeros(3, device=self.device)  # box, cls, dfl
@@ -719,7 +763,7 @@ class v8CLloss:
         )
 
         target_scores_sum = max(target_scores.sum(), 1)
-        
+
         # Cls loss
         # loss[1] = self.varifocal_loss(pred_scores, target_scores, target_labels) / target_scores_sum  # VFL way
         loss[1] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum  # BCE
@@ -770,6 +814,7 @@ class v8DetectionLoss:
         device = next(model.parameters()).device  # get model device
         h = model.args  # hyperparameters
 
+        self.model = model
         m = model.model[-1]  # Detect() module
         self.bce = nn.BCEWithLogitsLoss(reduction="none")
         self.hyp = h
@@ -784,6 +829,29 @@ class v8DetectionLoss:
         self.assigner = TaskAlignedAssigner(topk=tal_topk, num_classes=self.nc, alpha=0.5, beta=6.0)
         self.bbox_loss = BboxLoss(m.reg_max).to(device)
         self.proj = torch.arange(m.reg_max, dtype=torch.float, device=device)
+        self.buffer_size = int(getattr(h, "buffer_size", 10000))
+        self.hard_neg_weight = float(getattr(h, "hard_neg_weight", 2.0))
+        self.conf_threshold = float(getattr(h, "conf_threshold", 0.5))
+        self.topk_ratio = float(getattr(h, "topk_ratio", 0.1))
+        self.manual_hard_neg_weight = float(getattr(h, "manual_hard_neg_weight", self.hard_neg_weight))
+        self.hard_neg_log_interval = int(getattr(h, "hard_neg_log_interval", 50))
+        self.hard_neg_vis_max_store = int(getattr(h, "hard_neg_vis_max_store", 32))
+        self.hard_neg_vis_per_batch = int(getattr(h, "hard_neg_vis_per_batch", 2))
+        self.hard_neg_vis_samples = int(getattr(h, "hard_neg_vis_samples", 16))
+        self.hard_neg_buffer = HardNegativeBuffer(self.buffer_size)
+        self.hard_neg_visuals = deque(maxlen=max(self.hard_neg_vis_max_store, 0))
+        self.hard_neg_step = 0
+        self.total_mined_hard_neg = 0
+        self.total_buffered_hard_neg = 0
+        self.total_manual_hard_neg = 0
+        self.last_hard_neg_stats = {
+            "step": 0,
+            "batch_mined": 0,
+            "batch_hard_images": 0,
+            "batch_buffered": 0,
+            "batch_manual": 0,
+            "buffer_size": 0,
+        }
 
     def preprocess(self, targets, batch_size, scale_tensor):
         """Preprocesses the target counts and matches with the input batch size to output a tensor."""
@@ -811,6 +879,173 @@ class v8DetectionLoss:
             # pred_dist = pred_dist.view(b, a, c // 4, 4).transpose(2,3).softmax(3).matmul(self.proj.type(pred_dist.dtype))
             # pred_dist = (pred_dist.view(b, a, c // 4, 4).softmax(2) * self.proj.type(pred_dist.dtype).view(1, 1, -1, 1)).sum(2)
         return dist2bbox(pred_dist, anchor_points, xywh=False)
+
+    def _batch_paths(self, batch, batch_size):
+        """Return stable per-image identifiers for the current batch."""
+        paths = batch.get("im_file")
+        if paths is None:
+            return [str(i) for i in range(batch_size)]
+        return [str(path) for path in paths]
+
+    def _manual_hard_neg_image_mask(self, batch, batch_size):
+        """Return an optional per-image manual hard-negative mask if the dataset provides one."""
+        for key in ("hard_neg_mask", "manual_hard_neg_mask", "is_hard_negative"):
+            mask = batch.get(key)
+            if mask is None:
+                continue
+            mask = torch.as_tensor(mask, device=self.device).view(-1).bool()
+            if mask.numel() == batch_size:
+                return mask
+        return torch.zeros(batch_size, dtype=torch.bool, device=self.device)
+
+    def _select_topk_mask(self, scores, candidate_mask):
+        """Select the top-k anchors by detached classification loss."""
+        if self.topk_ratio <= 0:
+            return torch.zeros_like(candidate_mask)
+
+        flat_mask = candidate_mask.view(-1)
+        num_candidates = int(flat_mask.sum().item())
+        if num_candidates == 0:
+            return torch.zeros_like(candidate_mask)
+
+        k = max(int(num_candidates * self.topk_ratio), 1)
+        flat_scores = scores.view(-1)
+        selected = torch.zeros_like(flat_mask)
+        candidate_idx = flat_mask.nonzero(as_tuple=False).squeeze(1)
+        topk_idx = candidate_idx[flat_scores[candidate_idx].topk(min(k, num_candidates)).indices]
+        selected[topk_idx] = True
+        return selected.view_as(candidate_mask)
+
+    def _buffer_image_mask(self, batch, batch_size):
+        """Sample buffered hard-negative images and mark those present in the current batch."""
+        if len(self.hard_neg_buffer) == 0:
+            return torch.zeros(batch_size, dtype=torch.bool, device=self.device)
+
+        sample_ids = set(self.hard_neg_buffer.sample(batch_size))
+        if not sample_ids:
+            return torch.zeros(batch_size, dtype=torch.bool, device=self.device)
+
+        return torch.tensor(
+            [path in sample_ids for path in self._batch_paths(batch, batch_size)], dtype=torch.bool, device=self.device
+        )
+
+    def _collect_hard_negative_visuals(self, batch, hard_neg_mask, pred_conf, pred_bboxes, stride_tensor):
+        """Store a few hard-negative crops for end-of-training visualization."""
+        if self.hard_neg_vis_max_store <= 0 or self.hard_neg_vis_per_batch <= 0:
+            return
+        if not hard_neg_mask.any():
+            return
+
+        pred_boxes_img = (pred_bboxes.detach() * stride_tensor).round().long()
+        img_h, img_w = batch["img"].shape[2:]
+        candidate_scores = pred_conf.masked_fill(~hard_neg_mask, -1)
+        flat_scores = candidate_scores.view(-1)
+        valid = flat_scores > -1
+        if not valid.any():
+            return
+
+        topk = min(int(valid.sum().item()), self.hard_neg_vis_per_batch)
+        top_idx = flat_scores.topk(topk).indices.tolist()
+        images = (batch["img"].detach().clamp(0, 1) * 255).to(torch.uint8).cpu()
+        paths = self._batch_paths(batch, batch["img"].shape[0])
+
+        for flat_idx in top_idx:
+            b_idx = flat_idx // hard_neg_mask.shape[1]
+            a_idx = flat_idx % hard_neg_mask.shape[1]
+            x1, y1, x2, y2 = pred_boxes_img[b_idx, a_idx].tolist()
+            x1 = max(0, min(x1, img_w - 1))
+            y1 = max(0, min(y1, img_h - 1))
+            x2 = max(x1 + 2, min(x2, img_w))
+            y2 = max(y1 + 2, min(y2, img_h))
+            crop = images[b_idx, :, y1:y2, x1:x2]
+            if crop.numel() == 0:
+                continue
+            crop = crop.permute(1, 2, 0).numpy()
+            crop = cv2.resize(crop, (160, 160), interpolation=cv2.INTER_LINEAR)
+            self.hard_neg_visuals.append(
+                {"crop": crop, "score": float(pred_conf[b_idx, a_idx].item()), "path": Path(paths[b_idx]).name}
+            )
+
+    def _update_hard_negative_stats(self, hard_neg_mask, buffered_topk_mask, manual_hard_neg_image_mask):
+        """Update running hard-negative statistics and optionally log them."""
+        self.hard_neg_step += 1
+        batch_mined = int(hard_neg_mask.sum().item())
+        batch_hard_images = int(hard_neg_mask.any(1).sum().item())
+        batch_buffered = int(buffered_topk_mask.sum().item())
+        batch_manual = int((manual_hard_neg_image_mask.sum().item()) if manual_hard_neg_image_mask is not None else 0)
+
+        self.total_mined_hard_neg += batch_mined
+        self.total_buffered_hard_neg += batch_buffered
+        self.total_manual_hard_neg += batch_manual
+        self.last_hard_neg_stats = {
+            "step": self.hard_neg_step,
+            "batch_mined": batch_mined,
+            "batch_hard_images": batch_hard_images,
+            "batch_buffered": batch_buffered,
+            "batch_manual": batch_manual,
+            "buffer_size": len(self.hard_neg_buffer),
+        }
+
+        if self.hard_neg_log_interval > 0 and self.hard_neg_step % self.hard_neg_log_interval == 0:
+            LOGGER.info(
+                "Hard negatives: "
+                f"step={self.hard_neg_step}, "
+                f"mined={batch_mined}, "
+                f"hard_images={batch_hard_images}, "
+                f"buffer_hit={batch_buffered}, "
+                f"manual={batch_manual}, "
+                f"buffer_size={len(self.hard_neg_buffer)}"
+            )
+
+    def get_hard_negative_stats(self):
+        """Return cumulative and last-step hard-negative statistics."""
+        return {
+            **self.last_hard_neg_stats,
+            "total_mined": self.total_mined_hard_neg,
+            "total_buffered": self.total_buffered_hard_neg,
+            "total_manual": self.total_manual_hard_neg,
+            "visual_samples": len(self.hard_neg_visuals),
+        }
+
+    def save_hard_negative_visuals(self, save_dir, max_samples=None):
+        """Save a simple grid of mined hard-negative crops."""
+        if not self.hard_neg_visuals:
+            return None
+
+        samples = list(self.hard_neg_visuals)[-min(max_samples or self.hard_neg_vis_samples, len(self.hard_neg_visuals)) :]
+        tile_size, header_h, cols = 160, 22, min(4, max(len(samples), 1))
+        rows = math.ceil(len(samples) / cols)
+        canvas = np.full((rows * (tile_size + header_h), cols * tile_size, 3), 255, dtype=np.uint8)
+
+        for i, sample in enumerate(samples):
+            row, col = divmod(i, cols)
+            y0, x0 = row * (tile_size + header_h), col * tile_size
+            tile = sample["crop"].copy()
+            cv2.putText(
+                tile,
+                f"{sample['score']:.2f}",
+                (6, 18),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (0, 255, 255),
+                1,
+                cv2.LINE_AA,
+            )
+            canvas[y0 + header_h : y0 + header_h + tile_size, x0 : x0 + tile_size] = tile
+            cv2.putText(
+                canvas,
+                sample["path"][:20],
+                (x0 + 4, y0 + 16),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.42,
+                (32, 32, 32),
+                1,
+                cv2.LINE_AA,
+            )
+
+        out_file = Path(save_dir) / "hard_negative_samples.jpg"
+        cv2.imwrite(str(out_file), cv2.cvtColor(canvas, cv2.COLOR_RGB2BGR))
+        return out_file
 
     def __call__(self, preds, batch):
         """Calculate the sum of the loss for box, cls and dfl multiplied by batch size."""
@@ -857,7 +1092,33 @@ class v8DetectionLoss:
 
         # Cls loss
         # loss[1] = self.varifocal_loss(pred_scores, target_scores, target_labels) / target_scores_sum  # VFL way
-        loss[1] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum  # BCE
+        cls_loss = self.bce(pred_scores, target_scores.to(dtype))
+        cls_loss_anchor = cls_loss.detach().mean(-1)
+        bg_mask = ~fg_mask
+        pred_conf = pred_scores.detach().sigmoid().amax(-1)
+        conf_hard_neg_mask = bg_mask & pred_conf.gt(self.conf_threshold)
+        mined_topk_mask = self._select_topk_mask(cls_loss_anchor, bg_mask)
+        hard_neg_mask = conf_hard_neg_mask | mined_topk_mask
+
+        if self.model.training and self.buffer_size > 0:
+            buffered_image_mask = self._buffer_image_mask(batch, batch_size)
+            buffered_topk_mask = self._select_topk_mask(cls_loss_anchor, bg_mask & buffered_image_mask.unsqueeze(1))
+        else:
+            buffered_topk_mask = torch.zeros_like(bg_mask)
+
+        cls_weight = torch.ones_like(cls_loss)
+        if self.hard_neg_weight > 1:
+            hard_neg_weight = cls_weight.new_full((), self.hard_neg_weight)
+            cls_weight = torch.where(hard_neg_mask.unsqueeze(-1), hard_neg_weight, cls_weight)
+            cls_weight = torch.where(buffered_topk_mask.unsqueeze(-1), hard_neg_weight, cls_weight)
+
+        manual_hard_neg_image_mask = self._manual_hard_neg_image_mask(batch, batch_size)
+        if self.manual_hard_neg_weight > 1 and manual_hard_neg_image_mask.any():
+            manual_weight = cls_weight.new_full((), self.manual_hard_neg_weight)
+            manual_mask = bg_mask & manual_hard_neg_image_mask.unsqueeze(1)
+            cls_weight = torch.where(manual_mask.unsqueeze(-1), manual_weight, cls_weight)
+
+        loss[1] = (cls_loss * cls_weight).sum() / target_scores_sum  # BCE
 
         # Bbox loss
         if fg_mask.sum():
@@ -869,6 +1130,14 @@ class v8DetectionLoss:
         loss[0] *= self.hyp.box  # box gain
         loss[1] *= self.hyp.cls  # cls gain
         loss[2] *= self.hyp.dfl  # dfl gain
+
+        if self.model.training and self.buffer_size > 0:
+            batch_paths = self._batch_paths(batch, batch_size)
+            self.hard_neg_buffer.add(path for path, is_hard in zip(batch_paths, hard_neg_mask.any(1).tolist()) if is_hard)
+
+        if self.model.training:
+            self._collect_hard_negative_visuals(batch, hard_neg_mask, pred_conf, pred_bboxes, stride_tensor)
+            self._update_hard_negative_stats(hard_neg_mask, buffered_topk_mask, manual_hard_neg_image_mask)
 
         return loss.sum() * batch_size, loss.detach()  # loss(box, cls, dfl)
 

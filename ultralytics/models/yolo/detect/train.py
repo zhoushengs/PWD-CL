@@ -148,6 +148,27 @@ class DetectionTrainer(BaseTrainer):
         cls = np.concatenate([lb["cls"] for lb in self.train_loader.dataset.labels], 0)
         plot_labels(boxes, cls.squeeze(), names=self.data["names"], save_dir=self.save_dir, on_plot=self.on_plot)
 
+    def final_eval(self):
+        """Run final evaluation and export hard-negative mining artifacts when available."""
+        super().final_eval()
+        criterion = getattr(de_parallel(self.model), "criterion", None)
+        if criterion is None or not hasattr(criterion, "get_hard_negative_stats"):
+            return
+
+        stats = criterion.get_hard_negative_stats()
+        LOGGER.info(
+            "Hard negative summary: "
+            f"total_mined={stats['total_mined']}, "
+            f"total_buffer_hit={stats['total_buffered']}, "
+            f"total_manual={stats['total_manual']}, "
+            f"buffer_size={stats['buffer_size']}, "
+            f"visual_samples={stats['visual_samples']}"
+        )
+        if hasattr(criterion, "save_hard_negative_visuals"):
+            out_file = criterion.save_hard_negative_visuals(self.save_dir)
+            if out_file:
+                LOGGER.info(f"Saved hard negative visualization to {out_file}")
+
     def auto_batch(self):
         """Get batch size by calculating memory occupation of model."""
         train_dataset = self.build_dataset(self.trainset, mode="train", batch=16)
