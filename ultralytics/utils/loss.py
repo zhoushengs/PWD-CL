@@ -834,6 +834,8 @@ class v8DetectionLoss:
         self.conf_threshold = float(getattr(h, "conf_threshold", 0.5))
         self.topk_ratio = float(getattr(h, "topk_ratio", 0.1))
         self.manual_hard_neg_weight = float(getattr(h, "manual_hard_neg_weight", self.hard_neg_weight))
+        self.hard_neg_class_id = int(getattr(h, "hard_neg_class_id", min(self.nc - 1, 1)))
+        self.manual_hard_neg_class_id = int(getattr(h, "manual_hard_neg_class_id", 0))
         self.hard_neg_log_interval = int(getattr(h, "hard_neg_log_interval", 50))
         self.hard_neg_vis_max_store = int(getattr(h, "hard_neg_vis_max_store", 32))
         self.hard_neg_vis_per_batch = int(getattr(h, "hard_neg_vis_per_batch", 2))
@@ -888,15 +890,42 @@ class v8DetectionLoss:
         return [str(path) for path in paths]
 
     def _manual_hard_neg_image_mask(self, batch, batch_size):
-        """Return an optional per-image manual hard-negative mask if the dataset provides one."""
+        """Return a per-image manual hard-negative mask."""
+        cls = batch.get("cls")
+        batch_idx = batch.get("batch_idx")
+        if cls is not None and batch_idx is not None:
+            cls = cls.view(-1).to(self.device)
+            batch_idx = batch_idx.view(-1).long().to(self.device)
+            manual_mask = torch.zeros(batch_size, dtype=torch.bool, device=self.device)
+            manual_gt_mask = cls == self.manual_hard_neg_class_id
+            if manual_gt_mask.any():
+                manual_mask[batch_idx[manual_gt_mask]] = True
+        else:
+            manual_mask = torch.zeros(batch_size, dtype=torch.bool, device=self.device)
+
         for key in ("hard_neg_mask", "manual_hard_neg_mask", "is_hard_negative"):
             mask = batch.get(key)
             if mask is None:
                 continue
             mask = torch.as_tensor(mask, device=self.device).view(-1).bool()
             if mask.numel() == batch_size:
-                return mask
-        return torch.zeros(batch_size, dtype=torch.bool, device=self.device)
+                manual_mask |= mask
+        return manual_mask
+
+    def _positive_target_image_mask(self, batch, batch_size):
+        """Return a per-image mask for images containing the target positive class."""
+        cls = batch.get("cls")
+        batch_idx = batch.get("batch_idx")
+        if cls is None or batch_idx is None:
+            return torch.zeros(batch_size, dtype=torch.bool, device=self.device)
+
+        cls = cls.view(-1).to(self.device)
+        batch_idx = batch_idx.view(-1).long().to(self.device)
+        target_mask = torch.zeros(batch_size, dtype=torch.bool, device=self.device)
+        target_gt_mask = cls == self.hard_neg_class_id
+        if target_gt_mask.any():
+            target_mask[batch_idx[target_gt_mask]] = True
+        return target_mask
 
     def _select_topk_mask(self, scores, candidate_mask):
         """Select the top-k anchors by detached classification loss."""
@@ -929,7 +958,9 @@ class v8DetectionLoss:
             [path in sample_ids for path in self._batch_paths(batch, batch_size)], dtype=torch.bool, device=self.device
         )
 
-    def _collect_hard_negative_visuals(self, batch, hard_neg_mask, pred_conf, pred_bboxes, stride_tensor):
+    def _collect_hard_negative_visuals(
+        self, batch, hard_neg_mask, pred_conf, pred_bboxes, stride_tensor, manual_hard_neg_image_mask
+    ):
         """Store a few hard-negative crops for end-of-training visualization."""
         if self.hard_neg_vis_max_store <= 0 or self.hard_neg_vis_per_batch <= 0:
             return
@@ -963,7 +994,12 @@ class v8DetectionLoss:
             crop = crop.permute(1, 2, 0).numpy()
             crop = cv2.resize(crop, (160, 160), interpolation=cv2.INTER_LINEAR)
             self.hard_neg_visuals.append(
-                {"crop": crop, "score": float(pred_conf[b_idx, a_idx].item()), "path": Path(paths[b_idx]).name}
+                {
+                    "crop": crop,
+                    "score": float(pred_conf[b_idx, a_idx].item()),
+                    "path": Path(paths[b_idx]).name,
+                    "tag": "notree" if manual_hard_neg_image_mask[b_idx].item() else "bg",
+                }
             )
 
     def _update_hard_negative_stats(self, hard_neg_mask, buffered_topk_mask, manual_hard_neg_image_mask):
@@ -1023,7 +1059,7 @@ class v8DetectionLoss:
             tile = sample["crop"].copy()
             cv2.putText(
                 tile,
-                f"{sample['score']:.2f}",
+                f"s:{sample['score']:.2f}",
                 (6, 18),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.55,
@@ -1034,7 +1070,7 @@ class v8DetectionLoss:
             canvas[y0 + header_h : y0 + header_h + tile_size, x0 : x0 + tile_size] = tile
             cv2.putText(
                 canvas,
-                sample["path"][:20],
+                f"{sample['tag']} {sample['path'][:14]}",
                 (x0 + 4, y0 + 16),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.42,
@@ -1093,30 +1129,39 @@ class v8DetectionLoss:
         # Cls loss
         # loss[1] = self.varifocal_loss(pred_scores, target_scores, target_labels) / target_scores_sum  # VFL way
         cls_loss = self.bce(pred_scores, target_scores.to(dtype))
-        cls_loss_anchor = cls_loss.detach().mean(-1)
+        target_cls_loss = cls_loss[..., self.hard_neg_class_id].detach()
         bg_mask = ~fg_mask
-        pred_conf = pred_scores.detach().sigmoid().amax(-1)
+        pred_conf = pred_scores.detach().sigmoid()[..., self.hard_neg_class_id]
         conf_hard_neg_mask = bg_mask & pred_conf.gt(self.conf_threshold)
-        mined_topk_mask = self._select_topk_mask(cls_loss_anchor, bg_mask)
+        mined_topk_mask = self._select_topk_mask(target_cls_loss, bg_mask)
         hard_neg_mask = conf_hard_neg_mask | mined_topk_mask
+
+        manual_hard_neg_image_mask = self._manual_hard_neg_image_mask(batch, batch_size)
+        positive_target_image_mask = self._positive_target_image_mask(batch, batch_size)
+        pure_hard_neg_image_mask = hard_neg_mask.any(1) & ~positive_target_image_mask
 
         if self.model.training and self.buffer_size > 0:
             buffered_image_mask = self._buffer_image_mask(batch, batch_size)
-            buffered_topk_mask = self._select_topk_mask(cls_loss_anchor, bg_mask & buffered_image_mask.unsqueeze(1))
+            buffered_topk_mask = self._select_topk_mask(target_cls_loss, bg_mask & buffered_image_mask.unsqueeze(1))
         else:
             buffered_topk_mask = torch.zeros_like(bg_mask)
 
         cls_weight = torch.ones_like(cls_loss)
         if self.hard_neg_weight > 1:
             hard_neg_weight = cls_weight.new_full((), self.hard_neg_weight)
-            cls_weight = torch.where(hard_neg_mask.unsqueeze(-1), hard_neg_weight, cls_weight)
-            cls_weight = torch.where(buffered_topk_mask.unsqueeze(-1), hard_neg_weight, cls_weight)
+            cls_weight[..., self.hard_neg_class_id] = torch.where(
+                hard_neg_mask, hard_neg_weight, cls_weight[..., self.hard_neg_class_id]
+            )
+            cls_weight[..., self.hard_neg_class_id] = torch.where(
+                buffered_topk_mask, hard_neg_weight, cls_weight[..., self.hard_neg_class_id]
+            )
 
-        manual_hard_neg_image_mask = self._manual_hard_neg_image_mask(batch, batch_size)
         if self.manual_hard_neg_weight > 1 and manual_hard_neg_image_mask.any():
             manual_weight = cls_weight.new_full((), self.manual_hard_neg_weight)
             manual_mask = bg_mask & manual_hard_neg_image_mask.unsqueeze(1)
-            cls_weight = torch.where(manual_mask.unsqueeze(-1), manual_weight, cls_weight)
+            cls_weight[..., self.hard_neg_class_id] = torch.where(
+                manual_mask, manual_weight, cls_weight[..., self.hard_neg_class_id]
+            )
 
         loss[1] = (cls_loss * cls_weight).sum() / target_scores_sum  # BCE
 
@@ -1133,10 +1178,14 @@ class v8DetectionLoss:
 
         if self.model.training and self.buffer_size > 0:
             batch_paths = self._batch_paths(batch, batch_size)
-            self.hard_neg_buffer.add(path for path, is_hard in zip(batch_paths, hard_neg_mask.any(1).tolist()) if is_hard)
+            self.hard_neg_buffer.add(
+                path for path, is_hard in zip(batch_paths, pure_hard_neg_image_mask.tolist()) if is_hard
+            )
 
         if self.model.training:
-            self._collect_hard_negative_visuals(batch, hard_neg_mask, pred_conf, pred_bboxes, stride_tensor)
+            self._collect_hard_negative_visuals(
+                batch, hard_neg_mask, pred_conf, pred_bboxes, stride_tensor, manual_hard_neg_image_mask
+            )
             self._update_hard_negative_stats(hard_neg_mask, buffered_topk_mask, manual_hard_neg_image_mask)
 
         return loss.sum() * batch_size, loss.detach()  # loss(box, cls, dfl)
