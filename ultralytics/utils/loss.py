@@ -836,6 +836,9 @@ class v8DetectionLoss:
         self.manual_hard_neg_weight = float(getattr(h, "manual_hard_neg_weight", self.hard_neg_weight))
         self.hard_neg_class_id = int(getattr(h, "hard_neg_class_id", min(self.nc - 1, 1)))
         self.manual_hard_neg_class_id = int(getattr(h, "manual_hard_neg_class_id", 0))
+        self.notree_neg_weight = float(getattr(h, "notree_neg_weight", 1.5))
+        self.notree_conf_threshold = float(getattr(h, "notree_conf_threshold", self.conf_threshold))
+        self.notree_topk_ratio = float(getattr(h, "notree_topk_ratio", self.topk_ratio))
         self.hard_neg_log_interval = int(getattr(h, "hard_neg_log_interval", 50))
         self.hard_neg_vis_max_store = int(getattr(h, "hard_neg_vis_max_store", 32))
         self.hard_neg_vis_per_batch = int(getattr(h, "hard_neg_vis_per_batch", 2))
@@ -846,9 +849,12 @@ class v8DetectionLoss:
         self.total_mined_hard_neg = 0
         self.total_buffered_hard_neg = 0
         self.total_manual_hard_neg = 0
+        self.total_notree_neg = 0
         self.last_hard_neg_stats = {
             "step": 0,
             "batch_mined": 0,
+            "batch_sicktree_fp": 0,
+            "batch_notree_neg": 0,
             "batch_hard_images": 0,
             "batch_buffered": 0,
             "batch_manual": 0,
@@ -929,7 +935,11 @@ class v8DetectionLoss:
 
     def _select_topk_mask(self, scores, candidate_mask):
         """Select the top-k anchors by detached classification loss."""
-        if self.topk_ratio <= 0:
+        return self._select_topk_mask_with_ratio(scores, candidate_mask, self.topk_ratio)
+
+    def _select_topk_mask_with_ratio(self, scores, candidate_mask, ratio):
+        """Select the top-k anchors by detached classification loss using a custom ratio."""
+        if ratio <= 0:
             return torch.zeros_like(candidate_mask)
 
         flat_mask = candidate_mask.view(-1)
@@ -937,7 +947,7 @@ class v8DetectionLoss:
         if num_candidates == 0:
             return torch.zeros_like(candidate_mask)
 
-        k = max(int(num_candidates * self.topk_ratio), 1)
+        k = max(int(num_candidates * ratio), 1)
         flat_scores = scores.view(-1)
         selected = torch.zeros_like(flat_mask)
         candidate_idx = flat_mask.nonzero(as_tuple=False).squeeze(1)
@@ -959,17 +969,17 @@ class v8DetectionLoss:
         )
 
     def _collect_hard_negative_visuals(
-        self, batch, hard_neg_mask, pred_conf, pred_bboxes, stride_tensor, manual_hard_neg_image_mask
+        self, batch, mined_mask, pred_conf, pred_bboxes, stride_tensor, sample_tags
     ):
-        """Store a few hard-negative crops for end-of-training visualization."""
+        """Store a few hard-negative full-image views for end-of-training visualization."""
         if self.hard_neg_vis_max_store <= 0 or self.hard_neg_vis_per_batch <= 0:
             return
-        if not hard_neg_mask.any():
+        if not mined_mask.any():
             return
 
         pred_boxes_img = (pred_bboxes.detach() * stride_tensor).round().long()
         img_h, img_w = batch["img"].shape[2:]
-        candidate_scores = pred_conf.masked_fill(~hard_neg_mask, -1)
+        candidate_scores = pred_conf.masked_fill(~mined_mask, -1)
         flat_scores = candidate_scores.view(-1)
         valid = flat_scores > -1
         if not valid.any():
@@ -981,41 +991,53 @@ class v8DetectionLoss:
         paths = self._batch_paths(batch, batch["img"].shape[0])
 
         for flat_idx in top_idx:
-            b_idx = flat_idx // hard_neg_mask.shape[1]
-            a_idx = flat_idx % hard_neg_mask.shape[1]
+            b_idx = flat_idx // mined_mask.shape[1]
+            a_idx = flat_idx % mined_mask.shape[1]
             x1, y1, x2, y2 = pred_boxes_img[b_idx, a_idx].tolist()
             x1 = max(0, min(x1, img_w - 1))
             y1 = max(0, min(y1, img_h - 1))
             x2 = max(x1 + 2, min(x2, img_w))
             y2 = max(y1 + 2, min(y2, img_h))
-            crop = images[b_idx, :, y1:y2, x1:x2]
-            if crop.numel() == 0:
-                continue
-            crop = crop.permute(1, 2, 0).numpy()
-            crop = cv2.resize(crop, (160, 160), interpolation=cv2.INTER_LINEAR)
+            full_image = images[b_idx].permute(1, 2, 0).numpy().copy()
+            full_image = cv2.resize(full_image, (160, 160), interpolation=cv2.INTER_LINEAR)
+            scale_x, scale_y = 160.0 / img_w, 160.0 / img_h
+            box = (
+                int(round(x1 * scale_x)),
+                int(round(y1 * scale_y)),
+                int(round(x2 * scale_x)),
+                int(round(y2 * scale_y)),
+            )
             self.hard_neg_visuals.append(
                 {
-                    "crop": crop,
+                    "image": full_image,
+                    "box": box,
                     "score": float(pred_conf[b_idx, a_idx].item()),
                     "path": Path(paths[b_idx]).name,
-                    "tag": "notree" if manual_hard_neg_image_mask[b_idx].item() else "bg",
+                    "tag": sample_tags[b_idx][a_idx],
                 }
             )
 
-    def _update_hard_negative_stats(self, hard_neg_mask, buffered_topk_mask, manual_hard_neg_image_mask):
+    def _update_hard_negative_stats(
+        self, hard_neg_mask, notree_neg_mask, buffered_topk_mask, manual_hard_neg_image_mask
+    ):
         """Update running hard-negative statistics and optionally log them."""
         self.hard_neg_step += 1
-        batch_mined = int(hard_neg_mask.sum().item())
-        batch_hard_images = int(hard_neg_mask.any(1).sum().item())
+        batch_sicktree_fp = int(hard_neg_mask.sum().item())
+        batch_notree_neg = int(notree_neg_mask.sum().item())
+        batch_mined = batch_sicktree_fp + batch_notree_neg
+        batch_hard_images = int((hard_neg_mask | notree_neg_mask).any(1).sum().item())
         batch_buffered = int(buffered_topk_mask.sum().item())
         batch_manual = int((manual_hard_neg_image_mask.sum().item()) if manual_hard_neg_image_mask is not None else 0)
 
         self.total_mined_hard_neg += batch_mined
         self.total_buffered_hard_neg += batch_buffered
         self.total_manual_hard_neg += batch_manual
+        self.total_notree_neg += batch_notree_neg
         self.last_hard_neg_stats = {
             "step": self.hard_neg_step,
             "batch_mined": batch_mined,
+            "batch_sicktree_fp": batch_sicktree_fp,
+            "batch_notree_neg": batch_notree_neg,
             "batch_hard_images": batch_hard_images,
             "batch_buffered": batch_buffered,
             "batch_manual": batch_manual,
@@ -1027,6 +1049,8 @@ class v8DetectionLoss:
                 "Hard negatives: "
                 f"step={self.hard_neg_step}, "
                 f"mined={batch_mined}, "
+                f"sicktree_fp={batch_sicktree_fp}, "
+                f"notree_neg={batch_notree_neg}, "
                 f"hard_images={batch_hard_images}, "
                 f"buffer_hit={batch_buffered}, "
                 f"manual={batch_manual}, "
@@ -1040,6 +1064,7 @@ class v8DetectionLoss:
             "total_mined": self.total_mined_hard_neg,
             "total_buffered": self.total_buffered_hard_neg,
             "total_manual": self.total_manual_hard_neg,
+            "total_notree_neg": self.total_notree_neg,
             "visual_samples": len(self.hard_neg_visuals),
         }
 
@@ -1056,7 +1081,10 @@ class v8DetectionLoss:
         for i, sample in enumerate(samples):
             row, col = divmod(i, cols)
             y0, x0 = row * (tile_size + header_h), col * tile_size
-            tile = sample["crop"].copy()
+            tile = sample["image"].copy()
+            x1, y1, x2, y2 = sample["box"]
+            color = (255, 196, 0) if sample["tag"] == "sicktree_fp" else (0, 200, 0) if sample["tag"] == "notree" else (0, 128, 255)
+            cv2.rectangle(tile, (x1, y1), (x2, y2), color, 2)
             cv2.putText(
                 tile,
                 f"s:{sample['score']:.2f}",
@@ -1129,20 +1157,27 @@ class v8DetectionLoss:
         # Cls loss
         # loss[1] = self.varifocal_loss(pred_scores, target_scores, target_labels) / target_scores_sum  # VFL way
         cls_loss = self.bce(pred_scores, target_scores.to(dtype))
-        target_cls_loss = cls_loss[..., self.hard_neg_class_id].detach()
+        sicktree_cls_loss = cls_loss[..., self.hard_neg_class_id].detach()
+        notree_cls_loss = cls_loss[..., self.manual_hard_neg_class_id].detach()
         bg_mask = ~fg_mask
-        pred_conf = pred_scores.detach().sigmoid()[..., self.hard_neg_class_id]
-        conf_hard_neg_mask = bg_mask & pred_conf.gt(self.conf_threshold)
-        mined_topk_mask = self._select_topk_mask(target_cls_loss, bg_mask)
+        pred_scores_sigmoid = pred_scores.detach().sigmoid()
+        sicktree_conf = pred_scores_sigmoid[..., self.hard_neg_class_id]
+        notree_conf = pred_scores_sigmoid[..., self.manual_hard_neg_class_id]
+        conf_hard_neg_mask = bg_mask & sicktree_conf.gt(self.conf_threshold)
+        mined_topk_mask = self._select_topk_mask(sicktree_cls_loss, bg_mask)
         hard_neg_mask = conf_hard_neg_mask | mined_topk_mask
+        notree_conf_mask = bg_mask & notree_conf.gt(self.notree_conf_threshold)
+        notree_topk_mask = self._select_topk_mask_with_ratio(notree_cls_loss, bg_mask, self.notree_topk_ratio)
+        notree_neg_mask = (notree_conf_mask | notree_topk_mask) & ~hard_neg_mask
 
         manual_hard_neg_image_mask = self._manual_hard_neg_image_mask(batch, batch_size)
         positive_target_image_mask = self._positive_target_image_mask(batch, batch_size)
-        pure_hard_neg_image_mask = hard_neg_mask.any(1) & ~positive_target_image_mask
+        mined_mask = hard_neg_mask | notree_neg_mask
+        pure_hard_neg_image_mask = mined_mask.any(1) & ~positive_target_image_mask
 
         if self.model.training and self.buffer_size > 0:
             buffered_image_mask = self._buffer_image_mask(batch, batch_size)
-            buffered_topk_mask = self._select_topk_mask(target_cls_loss, bg_mask & buffered_image_mask.unsqueeze(1))
+            buffered_topk_mask = self._select_topk_mask(sicktree_cls_loss, bg_mask & buffered_image_mask.unsqueeze(1))
         else:
             buffered_topk_mask = torch.zeros_like(bg_mask)
 
@@ -1156,11 +1191,20 @@ class v8DetectionLoss:
                 buffered_topk_mask, hard_neg_weight, cls_weight[..., self.hard_neg_class_id]
             )
 
+        if self.notree_neg_weight > 1:
+            notree_weight = cls_weight.new_full((), self.notree_neg_weight)
+            cls_weight[..., self.manual_hard_neg_class_id] = torch.where(
+                notree_neg_mask, notree_weight, cls_weight[..., self.manual_hard_neg_class_id]
+            )
+
         if self.manual_hard_neg_weight > 1 and manual_hard_neg_image_mask.any():
             manual_weight = cls_weight.new_full((), self.manual_hard_neg_weight)
             manual_mask = bg_mask & manual_hard_neg_image_mask.unsqueeze(1)
             cls_weight[..., self.hard_neg_class_id] = torch.where(
                 manual_mask, manual_weight, cls_weight[..., self.hard_neg_class_id]
+            )
+            cls_weight[..., self.manual_hard_neg_class_id] = torch.where(
+                manual_mask, manual_weight, cls_weight[..., self.manual_hard_neg_class_id]
             )
 
         loss[1] = (cls_loss * cls_weight).sum() / target_scores_sum  # BCE
@@ -1183,10 +1227,15 @@ class v8DetectionLoss:
             )
 
         if self.model.training:
+            sample_tags = np.full(mined_mask.shape, "bg", dtype=object)
+            sample_tags[notree_neg_mask.cpu().numpy()] = "notree"
+            sample_tags[hard_neg_mask.cpu().numpy()] = "sicktree_fp"
             self._collect_hard_negative_visuals(
-                batch, hard_neg_mask, pred_conf, pred_bboxes, stride_tensor, manual_hard_neg_image_mask
+                batch, mined_mask, sicktree_conf, pred_bboxes, stride_tensor, sample_tags
             )
-            self._update_hard_negative_stats(hard_neg_mask, buffered_topk_mask, manual_hard_neg_image_mask)
+            self._update_hard_negative_stats(
+                hard_neg_mask, notree_neg_mask, buffered_topk_mask, manual_hard_neg_image_mask
+            )
 
         return loss.sum() * batch_size, loss.detach()  # loss(box, cls, dfl)
 

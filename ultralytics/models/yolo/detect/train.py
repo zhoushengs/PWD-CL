@@ -159,6 +159,7 @@ class DetectionTrainer(BaseTrainer):
         LOGGER.info(
             "Hard negative summary: "
             f"total_mined={stats['total_mined']}, "
+            f"total_notree_neg={stats.get('total_notree_neg', 0)}, "
             f"total_buffer_hit={stats['total_buffered']}, "
             f"total_manual={stats['total_manual']}, "
             f"buffer_size={stats['buffer_size']}, "
