@@ -839,6 +839,7 @@ class v8DetectionLoss:
         self.notree_neg_weight = float(getattr(h, "notree_neg_weight", 1.5))
         self.notree_conf_threshold = float(getattr(h, "notree_conf_threshold", self.conf_threshold))
         self.notree_topk_ratio = float(getattr(h, "notree_topk_ratio", self.topk_ratio))
+        self.hard_neg_iou_threshold = float(getattr(h, "hard_neg_iou_threshold", 0.1))
         self.hard_neg_log_interval = int(getattr(h, "hard_neg_log_interval", 50))
         self.hard_neg_vis_max_store = int(getattr(h, "hard_neg_vis_max_store", 32))
         self.hard_neg_vis_per_batch = int(getattr(h, "hard_neg_vis_per_batch", 2))
@@ -967,6 +968,29 @@ class v8DetectionLoss:
         return torch.tensor(
             [path in sample_ids for path in self._batch_paths(batch, batch_size)], dtype=torch.bool, device=self.device
         )
+
+    def _max_iou_to_target_gt(self, pred_boxes, gt_boxes, gt_labels, mask_gt):
+        """Return per-anchor max IoU to target-class GT boxes for each image."""
+        max_iou = pred_boxes.new_zeros(pred_boxes.shape[:2])
+        if self.hard_neg_iou_threshold <= 0:
+            return max_iou
+
+        target_label = gt_labels.new_tensor(float(self.hard_neg_class_id))
+        for i in range(pred_boxes.shape[0]):
+            valid_gt = mask_gt[i, :, 0].bool() & (gt_labels[i, :, 0] == target_label)
+            if not valid_gt.any():
+                continue
+            target_gt_boxes = gt_boxes[i, valid_gt]
+            pred_xyxy = pred_boxes[i].unsqueeze(1)  # [N, 1, 4]
+            gt_xyxy = target_gt_boxes.unsqueeze(0)  # [1, M, 4]
+            inter_w = (pred_xyxy[..., 2].minimum(gt_xyxy[..., 2]) - pred_xyxy[..., 0].maximum(gt_xyxy[..., 0])).clamp_(0)
+            inter_h = (pred_xyxy[..., 3].minimum(gt_xyxy[..., 3]) - pred_xyxy[..., 1].maximum(gt_xyxy[..., 1])).clamp_(0)
+            inter = inter_w * inter_h
+            pred_area = (pred_xyxy[..., 2] - pred_xyxy[..., 0]).clamp_(0) * (pred_xyxy[..., 3] - pred_xyxy[..., 1]).clamp_(0)
+            gt_area = (gt_xyxy[..., 2] - gt_xyxy[..., 0]).clamp_(0) * (gt_xyxy[..., 3] - gt_xyxy[..., 1]).clamp_(0)
+            union = pred_area + gt_area - inter + 1e-7
+            max_iou[i] = (inter / union).max(dim=1).values
+        return max_iou
 
     def _collect_hard_negative_visuals(
         self, batch, mined_mask, pred_conf, pred_bboxes, stride_tensor, sample_tags
@@ -1169,6 +1193,11 @@ class v8DetectionLoss:
         notree_conf_mask = bg_mask & notree_conf.gt(self.notree_conf_threshold)
         notree_topk_mask = self._select_topk_mask_with_ratio(notree_cls_loss, bg_mask, self.notree_topk_ratio)
         notree_neg_mask = (notree_conf_mask | notree_topk_mask) & ~hard_neg_mask
+        pred_bboxes_img = pred_bboxes.detach() * stride_tensor
+        max_iou_to_sicktree_gt = self._max_iou_to_target_gt(pred_bboxes_img, gt_bboxes, gt_labels, mask_gt)
+        low_iou_mask = max_iou_to_sicktree_gt.lt(self.hard_neg_iou_threshold)
+        hard_neg_mask &= low_iou_mask
+        notree_neg_mask &= low_iou_mask
 
         manual_hard_neg_image_mask = self._manual_hard_neg_image_mask(batch, batch_size)
         positive_target_image_mask = self._positive_target_image_mask(batch, batch_size)
@@ -1177,7 +1206,9 @@ class v8DetectionLoss:
 
         if self.model.training and self.buffer_size > 0:
             buffered_image_mask = self._buffer_image_mask(batch, batch_size)
-            buffered_topk_mask = self._select_topk_mask(sicktree_cls_loss, bg_mask & buffered_image_mask.unsqueeze(1))
+            buffered_topk_mask = self._select_topk_mask(
+                sicktree_cls_loss, bg_mask & buffered_image_mask.unsqueeze(1) & low_iou_mask
+            )
         else:
             buffered_topk_mask = torch.zeros_like(bg_mask)
 
