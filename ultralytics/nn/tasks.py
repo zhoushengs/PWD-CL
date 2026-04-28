@@ -1065,7 +1065,7 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             C2fCIB,
             WGAFM,
             WGAFMdown,
-            GSConv, GSConvns, VoVGSCSP, VoVGSCSPns, VoVGSCSPC, C2f_WTConv, WTConv2d, HWD, C2f_MambaOut, C2f_EA,C2f_RVB
+            GSConv, GSConvns, VoVGSCSP, VoVGSCSPns, VoVGSCSPC, C2f_WTConv, WTConv2d, HWD, C2f_MambaOut, C2f_EA, C2f_EA_Lite, C2f_EViT_Lite, C2f_RVB
         }:
             c1, c2 = ch[f], args[0]
             if c2 != nc:  # if c2 not equal to number of classes (i.e. for Classify() output)
@@ -1092,7 +1092,7 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
                 C2fPSA,
                 C2fCIB,
                 C2PSA,
-                VoVGSCSP, VoVGSCSPns, VoVGSCSPC,C2f_WTConv, C2f_MambaOut, C2f_EA,C2f_RVB
+                VoVGSCSP, VoVGSCSPns, VoVGSCSPC,C2f_WTConv, C2f_MambaOut, C2f_EA, C2f_EA_Lite, C2f_EViT_Lite, C2f_RVB
             }:
                 args.insert(2, n)  # number of repeats
                 n = 1

@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.init as init
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 from functools import partial
 from typing import List
@@ -16,7 +17,7 @@ import torch.nn.functional as F
 
 __all__ = ['PatchEmbed',
            'WTConv2d',
-           'C2f_WTConv', 'HWD', 'C2f_MambaOut','C2f_EA','C2f_RVB']
+           'C2f_WTConv', 'HWD', 'C2f_MambaOut','C2f_EA','C2f_EA_Lite','C2f_EViT_Lite','C2f_RVB']
 
 class Residual(nn.Module):
     def __init__(self, fn):
@@ -107,6 +108,16 @@ class C2f_EA(C2f):
         super().__init__(c1, c2, n, shortcut, g, e)
         self.m = nn.ModuleList(ExternalAttention(self.c) for _ in range(n))
 
+class C2f_EA_Lite(C2f):
+    def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5, reduction=4, S=32):
+        super().__init__(c1, c2, n, shortcut, g, e)
+        self.m = nn.ModuleList(ExternalAttentionLite(self.c, reduction, S) for _ in range(n))
+
+class C2f_EViT_Lite(C2f):
+    def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5, kernel_size=5, reduction=8, chunk_ratio=0.5):
+        super().__init__(c1, c2, n, shortcut, g, e)
+        self.m = nn.ModuleList(EfficientViTLiteBlock(self.c, kernel_size, reduction, chunk_ratio) for _ in range(n))
+
 class ExternalAttention(nn.Module):
 
     def __init__(self, d_model,S=64):
@@ -149,6 +160,70 @@ class ExternalAttention(nn.Module):
 
 
         return out
+
+class ExternalAttentionLite(nn.Module):
+
+    def __init__(self, d_model, reduction=4, S=32):
+        super().__init__()
+        d_hidden = max(16, d_model // reduction)
+        self.conv1 = Conv(d_model, d_hidden, 1, 1)
+        self.mk = nn.Conv1d(d_hidden, S, 1, bias=False)
+        self.mv = nn.Conv1d(S, d_hidden, 1, bias=False)
+        self.softmax = nn.Softmax(dim=1)
+        self.conv2 = Conv(d_hidden, d_model, 1, 1)
+        self.init_weights()
+
+    def init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv1d):
+                init.kaiming_normal_(m.weight, mode='fan_out')
+            elif isinstance(m, nn.Conv2d):
+                init.kaiming_normal_(m.weight, mode='fan_out')
+                if m.bias is not None:
+                    init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm2d):
+                init.constant_(m.weight, 1)
+                init.constant_(m.bias, 0)
+
+    def forward(self, x):
+        identity = x
+        x = self.conv1(x)
+        b, c, h, w = x.shape
+        attn = self.mk(x.view(b, c, h * w))
+        attn = self.softmax(attn)
+        attn = attn / torch.sum(attn, dim=2, keepdim=True)
+        out = self.mv(attn).view(b, c, h, w)
+        out = self.conv2(out)
+        return out + identity
+
+class EfficientViTLiteBlock(nn.Module):
+
+    def __init__(self, dim, kernel_size=5, reduction=8, chunk_ratio=0.5):
+        super().__init__()
+        kernel_size = int(kernel_size)
+        gate_channels = max(16, dim // reduction)
+        mixed_channels = max(1, int(dim * chunk_ratio))
+        self.mixed_channels = mixed_channels
+        self.local_mixer = nn.Sequential(
+            nn.Conv2d(mixed_channels, mixed_channels, kernel_size, 1, kernel_size // 2, groups=mixed_channels, bias=False),
+            nn.BatchNorm2d(mixed_channels),
+            nn.SiLU(inplace=True),
+        )
+        self.channel_gate = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(dim, gate_channels, 1, bias=True),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(gate_channels, dim, 1, bias=True),
+            nn.Hardsigmoid(inplace=True),
+        )
+
+    def forward(self, x):
+        identity = x
+        x_mix, x_keep = torch.split(x, [self.mixed_channels, x.shape[1] - self.mixed_channels], dim=1)
+        x_mix = self.local_mixer(x_mix)
+        x = torch.cat((x_mix, x_keep), dim=1)
+        x = x * self.channel_gate(x)
+        return x + identity
 
 ######################################## HWD start ########################################
 
