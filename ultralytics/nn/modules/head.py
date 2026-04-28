@@ -532,8 +532,43 @@ class DetectWithObjectMoCo(Detect):
 class DetectWithMoCoBK(DetectWithObjectMoCo):
     """YOLO Detection head with MoCo and Backbone Knowledge distillation."""
 
-    def __init__(self, nc=80, ch=()):
-        super().__init__(nc, ch)    
+    def __init__(self, nc=80, ch=(), queue_size=8192 * 2, momentum=0.999, feature_dim=32, roi_output_size=7):
+        if len(ch) < 3:
+            raise ValueError("DetectWithMoCoBK expects at least 3 channels: optional BK features followed by detect features.")
+
+        bk_ch = ch[:2]
+        det_ch = ch[2:]
+        Detect.__init__(self, nc=nc, ch=det_ch)
+
+        if len(bk_ch) < 2:
+            raise ValueError("DetectWithMoCoBK expects two BK feature channels before the detect feature channels.")
+
+        self.feature_dim = feature_dim
+        self.roi_output_size = roi_output_size
+        self.momentum = momentum
+        self.queue_size = queue_size
+        self.nc = nc
+        self.hidden_dim = 2 * feature_dim
+
+        c_feat_map_for_roi = bk_ch[0]
+        feature_dim_2 = bk_ch[1]
+        self.dim_map = nn.Sequential(
+            nn.Conv2d(feature_dim_2, c_feat_map_for_roi, kernel_size=1, bias=False),
+            nn.BatchNorm2d(c_feat_map_for_roi),
+            nn.ReLU()
+        )
+        self.query_encoder = EncoderWithProjectorEA(c_feat_map_for_roi, self.feature_dim, self.hidden_dim)
+        self.key_encoder = EncoderWithProjectorEA(c_feat_map_for_roi, self.feature_dim, self.hidden_dim)
+
+        for param_q, param_k in zip(self.query_encoder.parameters(), self.key_encoder.parameters()):
+            param_k.data.copy_(param_q.data)
+            param_k.requires_grad = False
+
+        self.register_buffer('queue', torch.randn(self.nc, self.queue_size, self.feature_dim))
+        self.queue = F.normalize(self.queue, p=2, dim=2)
+        self.register_buffer('queue_ptr', torch.zeros(self.nc, dtype=torch.long))
+        self.register_buffer('class_freq', torch.zeros(self.nc))
+        self.total_samples = 0
     
     def forward(self, x_pyramid_from_neck: List[torch.Tensor], batch: dict = None):
         """
@@ -552,9 +587,10 @@ class DetectWithMoCoBK(DetectWithObjectMoCo):
         raw_features_for_moco = [feat.clone() for feat in x_pyramid_from_neck[:2]]
 
         # Standard YOLO detection head processing
+        det_features = x_pyramid_from_neck[2:]
         det_head_outputs = []
-        for i in range(2, self.nl):  # self.nl is number of detection layers
-            det_head_outputs.append(torch.cat((self.cv2[i](x_pyramid_from_neck[i]), self.cv3[i](x_pyramid_from_neck[i])), 1))
+        for i in range(self.nl):  # self.nl is number of detection layers
+            det_head_outputs.append(torch.cat((self.cv2[i](det_features[i]), self.cv3[i](det_features[i])), 1))
 
         # --- MoCo Feature Extraction (only during training and if GT is available) ---
         moco_query_features = None
