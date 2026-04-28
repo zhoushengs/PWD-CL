@@ -1324,6 +1324,11 @@ class v8MoCoDetectionLoss(v8DetectionLoss):
             total_loss = det_loss + self.contrastive_weight * cl_loss* contrastive_scale
 
             # 4. 返回损失和详细信息
+            head = self.model.model[-1]
+            if key_features is not None and object_labels is not None and key_features.numel() > 0:
+                with torch.no_grad():
+                    head._dequeue_and_enqueue(key_features.detach(), object_labels.detach())
+
             loss_items = torch.cat([det_loss_items, cl_loss.detach().unsqueeze(0)])
             return total_loss, loss_items
         else:

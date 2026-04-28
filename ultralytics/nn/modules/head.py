@@ -511,10 +511,6 @@ class DetectWithObjectMoCo(Detect):
                 moco_object_labels = gt_labels
                 #moco_object_labels = torch.cat([gt_labels, gt_labels], dim=0)
 
-                # Dequeue and Enqueue with detached key features
-                if moco_key_features is not None and moco_key_features.numel() > 0:
-                    self._dequeue_and_enqueue(moco_key_features.detach(), moco_object_labels)
-        
         # --- Return appropriate outputs ---
         if self.training:
             # Pass all necessary components to the loss function
@@ -635,10 +631,6 @@ class DetectWithMoCoBK(DetectWithObjectMoCo):
                 moco_object_labels = gt_labels
                 #moco_object_labels = torch.cat([gt_labels, gt_labels], dim=0)
 
-                # Dequeue and Enqueue with detached key features
-                if moco_key_features is not None and moco_key_features.numel() > 0:
-                    self._dequeue_and_enqueue(moco_key_features.detach(), moco_object_labels)
-        
         # --- Return appropriate outputs ---
         if self.training:
             # Pass all necessary components to the loss function
