@@ -320,6 +320,7 @@ class DetectWithObjectMoCo(Detect):
         self.register_buffer('queue', torch.randn(self.nc, self.queue_size, self.feature_dim))
         self.queue = F.normalize(self.queue, p=2, dim=2)  # Normalize features in the queue
         self.register_buffer('queue_ptr', torch.zeros(self.nc, dtype=torch.long))
+        self.register_buffer('queue_counts', torch.zeros(self.nc, dtype=torch.long))
 
         # Optional: For class frequency statistics (if needed by other parts of your code)
         self.register_buffer('class_freq', torch.zeros(self.nc))
@@ -351,6 +352,7 @@ class DetectWithObjectMoCo(Detect):
             ptr = int(self.queue_ptr[label])
             self.queue[label, ptr] = encoded_key_features[i] # Enqueue the new key feature
             self.queue_ptr[label] = (ptr + 1) % self.queue_size # Move pointer
+            self.queue_counts[label] = torch.clamp(self.queue_counts[label] + 1, max=self.queue_size)
 
     def _extract_roi_encoded_features(self,
                                       feature_maps_from_neck: List[torch.Tensor],
@@ -516,7 +518,8 @@ class DetectWithObjectMoCo(Detect):
             # Pass all necessary components to the loss function
             return (det_head_outputs, raw_features_for_moco, 
                     moco_query_features, moco_key_features, 
-                    moco_object_labels, self.queue.clone().detach()) # Pass a snapshot of the queue
+                    moco_object_labels, self.queue.clone().detach(),
+                    self.queue_counts.clone().detach()) # Pass a snapshot of the queue
         else:
             # Standard inference path
             # self._inference processes det_head_outputs to final detections
@@ -563,6 +566,7 @@ class DetectWithMoCoBK(DetectWithObjectMoCo):
         self.register_buffer('queue', torch.randn(self.nc, self.queue_size, self.feature_dim))
         self.queue = F.normalize(self.queue, p=2, dim=2)
         self.register_buffer('queue_ptr', torch.zeros(self.nc, dtype=torch.long))
+        self.register_buffer('queue_counts', torch.zeros(self.nc, dtype=torch.long))
         self.register_buffer('class_freq', torch.zeros(self.nc))
         self.total_samples = 0
     
@@ -636,7 +640,8 @@ class DetectWithMoCoBK(DetectWithObjectMoCo):
             # Pass all necessary components to the loss function
             return (det_head_outputs, raw_features_for_moco, 
                     moco_query_features, moco_key_features, 
-                    moco_object_labels, self.queue.clone().detach()) # Pass a snapshot of the queue
+                    moco_object_labels, self.queue.clone().detach(),
+                    self.queue_counts.clone().detach()) # Pass a snapshot of the queue
         else:
             # Standard inference path
             # self._inference processes det_head_outputs to final detections

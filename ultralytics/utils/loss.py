@@ -1299,8 +1299,12 @@ class v8MoCoDetectionLoss(v8DetectionLoss):
             loss_items: 各项损失的详细信息。
         """
         # 解包预测值
-        if isinstance(preds, tuple) and len(preds) == 6:
-            det_head_outputs, raw_features, query_features, key_features, object_labels, queue_snapshot = preds
+        if isinstance(preds, tuple) and len(preds) in {6, 7}:
+            if len(preds) == 7:
+                det_head_outputs, raw_features, query_features, key_features, object_labels, queue_snapshot, queue_counts = preds
+            else:
+                det_head_outputs, raw_features, query_features, key_features, object_labels, queue_snapshot = preds
+                queue_counts = None
 
             # 1. 计算标准检测损失
             det_loss, det_loss_items = super().__call__((raw_features, det_head_outputs), batch)
@@ -1317,7 +1321,7 @@ class v8MoCoDetectionLoss(v8DetectionLoss):
             if contrastive_scale > 0 and query_features is not None and key_features is not None and object_labels is not None:
                 if query_features.shape[0] > 1:  # 至少需要两个对象特征
                     # 计算对比损失
-                    cl_loss = self._compute_contrastive_loss(query_features, key_features, object_labels, queue_snapshot)
+                    cl_loss = self._compute_contrastive_loss(query_features, key_features, object_labels, queue_snapshot, queue_counts)
                     #cl_loss = cl_loss * contrastive_scale
 
             # 3. 合并损失
@@ -1334,7 +1338,7 @@ class v8MoCoDetectionLoss(v8DetectionLoss):
         else:
             return super().__call__(preds, batch)
 
-    def _compute_contrastive_loss(self, query_features, key_features, object_labels, queue_snapshot):
+    def _compute_contrastive_loss(self, query_features, key_features, object_labels, queue_snapshot, queue_counts=None):
         """
         计算对象级别的对比损失。
         Args:
@@ -1451,7 +1455,7 @@ class v8MoCoDetectionLoss(v8DetectionLoss):
         loss_per_sample = -torch.log((pos_exp + eps) / (all_exp + eps))   # [N]
         return loss_per_sample.mean()
     
-    def _stable_moco_contrastive_loss(self, query_features, key_features, object_labels, queue_snapshot):
+    def _stable_moco_contrastive_loss(self, query_features, key_features, object_labels, queue_snapshot, queue_counts=None):
         """Compute a stable supervised contrastive loss using batch and queue positives."""
         device = query_features.device
         q = F.normalize(query_features.to(device), dim=1)
@@ -1465,6 +1469,12 @@ class v8MoCoDetectionLoss(v8DetectionLoss):
         c, qsize, _ = queue_snapshot.shape
         queue_feats = F.normalize(queue_snapshot.to(device).view(c * qsize, d), dim=1)
         queue_labels = torch.arange(c, device=device).unsqueeze(1).repeat(1, qsize).view(-1)
+        if queue_counts is None:
+            queue_valid = torch.ones(c, qsize, dtype=torch.bool, device=device)
+        else:
+            queue_counts = queue_counts.to(device).clamp_(min=0, max=qsize)
+            queue_valid = torch.arange(qsize, device=device).view(1, -1).lt(queue_counts.view(-1, 1))
+        queue_valid = queue_valid.view(-1)
 
         temp = max(float(getattr(self.hyp, "temperature", 0.1)), 1e-6)
         logits_batch = torch.matmul(q, k.t()) / temp
@@ -1473,6 +1483,7 @@ class v8MoCoDetectionLoss(v8DetectionLoss):
         pos_mask_batch = labels.view(-1, 1).eq(labels.view(1, -1))
         pos_mask_batch.fill_diagonal_(False)
         pos_mask_queue = labels.view(-1, 1).eq(queue_labels.view(1, -1))
+        pos_mask_queue &= queue_valid.view(1, -1)
         valid_mask = pos_mask_batch.any(dim=1) | pos_mask_queue.any(dim=1)
 
         if not valid_mask.any():
@@ -1480,6 +1491,11 @@ class v8MoCoDetectionLoss(v8DetectionLoss):
 
         logits = torch.cat([logits_batch, logits_queue], dim=1)
         pos_mask = torch.cat([pos_mask_batch, pos_mask_queue], dim=1).float()
+        valid_logit_mask = torch.cat(
+            [torch.ones(n, n, dtype=torch.bool, device=device), queue_valid.view(1, -1).expand(n, -1)],
+            dim=1,
+        )
+        logits = logits.masked_fill(~valid_logit_mask, float("-inf"))
         logits = logits - logits.max(dim=1, keepdim=True).values.detach()
         exp_logits = torch.exp(logits)
 
