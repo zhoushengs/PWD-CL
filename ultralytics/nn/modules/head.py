@@ -312,8 +312,8 @@ class DetectWithObjectMoCo(Detect):
         self.key_encoder = EncoderWithProjectorEA(c_feat_map_for_roi, self.feature_dim, self.hidden_dim)
 
         # Initialize key_encoder with query_encoTder weights and stop its gradients
-        for param_q, param_k in zip(self.query_encoder.parameters(), self.key_encoder.parameters()):
-            param_k.data.copy_(param_q.data)
+        self._copy_key_encoder_from_query()
+        for param_k in self.key_encoder.parameters():
             param_k.requires_grad = False
 
         # MoCo Queue for negative keys (one queue per class)
@@ -327,10 +327,43 @@ class DetectWithObjectMoCo(Detect):
         self.total_samples = 0
     
     @torch.no_grad()
-    def _momentum_update_key_encoder(self):
-        """Momentum update of the key encoder."""
+    def _copy_key_encoder_from_query(self):
+        """Copy query encoder parameters and buffers to the key encoder."""
         for param_q, param_k in zip(self.query_encoder.parameters(), self.key_encoder.parameters()):
-            param_k.data = param_k.data * self.momentum + param_q.data * (1.0 - self.momentum)
+            param_k.data.copy_(param_q.data)
+        for buffer_q, buffer_k in zip(self.query_encoder.buffers(), self.key_encoder.buffers()):
+            buffer_k.data.copy_(buffer_q.data)
+
+    @torch.no_grad()
+    def _momentum_update_key_encoder(self):
+        """Momentum update key encoder parameters and normalization buffers."""
+        for param_q, param_k in zip(self.query_encoder.parameters(), self.key_encoder.parameters()):
+            param_k.data.mul_(self.momentum).add_(param_q.data, alpha=1.0 - self.momentum)
+        for buffer_q, buffer_k in zip(self.query_encoder.buffers(), self.key_encoder.buffers()):
+            if torch.is_floating_point(buffer_k):
+                buffer_k.data.mul_(self.momentum).add_(buffer_q.data, alpha=1.0 - self.momentum)
+            else:
+                buffer_k.data.copy_(buffer_q.data)
+
+    @torch.no_grad()
+    def _extract_key_roi_encoded_features(self,
+                                          feature_maps_from_neck: List[torch.Tensor],
+                                          bboxes_abs_img_scale: torch.Tensor,
+                                          batch_indices_for_roi: torch.Tensor,
+                                          current_batch_img_shapes: torch.Tensor):
+        """Extract target RoI features without updating key encoder BatchNorm statistics."""
+        was_training = self.key_encoder.training
+        self.key_encoder.eval()
+        try:
+            return self._extract_roi_encoded_features(
+                feature_maps_from_neck,
+                bboxes_abs_img_scale,
+                batch_indices_for_roi,
+                current_batch_img_shapes,
+                self.key_encoder
+            )
+        finally:
+            self.key_encoder.train(was_training)
     
     @torch.no_grad()
     def _dequeue_and_enqueue(self, encoded_key_features, object_labels):
@@ -502,12 +535,11 @@ class DetectWithObjectMoCo(Detect):
                 # Extract Key Features (with no_grad context for key_encoder path)
                 with torch.no_grad():
                     self._momentum_update_key_encoder()  # Update key encoder parameters
-                    moco_key_features = self._extract_roi_encoded_features(
+                    moco_key_features = self._extract_key_roi_encoded_features(
                         key_input_features,
                         gt_bboxes_img_scale,
                         batch_indices_for_gt,
-                        current_batch_img_shapes,
-                        self.key_encoder
+                        current_batch_img_shapes
                     )
                 
                 moco_object_labels = gt_labels
@@ -559,8 +591,8 @@ class DetectWithMoCoBK(DetectWithObjectMoCo):
         self.query_encoder = EncoderWithProjectorEA(c_feat_map_for_roi, self.feature_dim, self.hidden_dim)
         self.key_encoder = EncoderWithProjectorEA(c_feat_map_for_roi, self.feature_dim, self.hidden_dim)
 
-        for param_q, param_k in zip(self.query_encoder.parameters(), self.key_encoder.parameters()):
-            param_k.data.copy_(param_q.data)
+        self._copy_key_encoder_from_query()
+        for param_k in self.key_encoder.parameters():
             param_k.requires_grad = False
 
         self.register_buffer('queue', torch.randn(self.nc, self.queue_size, self.feature_dim))
@@ -624,12 +656,11 @@ class DetectWithMoCoBK(DetectWithObjectMoCo):
                 # Extract Key Features (with no_grad context for key_encoder path)
                 with torch.no_grad():
                     self._momentum_update_key_encoder()  # Update key encoder parameters
-                    moco_key_features = self._extract_roi_encoded_features(
+                    moco_key_features = self._extract_key_roi_encoded_features(
                         key_input_features,
                         gt_bboxes_img_scale,
                         batch_indices_for_gt,
-                        current_batch_img_shapes,
-                        self.key_encoder
+                        current_batch_img_shapes
                     )
                 
                 moco_object_labels = gt_labels
