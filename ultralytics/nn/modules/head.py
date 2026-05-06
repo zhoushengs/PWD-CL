@@ -245,6 +245,20 @@ class EncoderWithProjectorEA(nn.Module):
         z = F.normalize(z, dim=1)    # contrastive 推荐加
         return z
 
+class FeaturePredictor(nn.Module):
+    """Small MLP predictor for online contrastive features."""
+
+    def __init__(self, feat_dim, hidden_dim=64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(feat_dim, hidden_dim, bias=False),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, feat_dim, bias=True),
+        )
+
+    def forward(self, x):
+        return F.normalize(self.net(x), dim=1)
 
 
 class DetectWithObjectMoCo(Detect):
@@ -523,7 +537,6 @@ class DetectWithObjectMoCo(Detect):
                 #     current_batch_img_shapes_list.append(torch.tensor([h_img, w_img], device=batch['img'].device, dtype=torch.float))
                 # current_batch_img_shapes = torch.stack(current_batch_img_shapes_list)
 
-                # Extract Query Features
                 moco_query_features = self._extract_roi_encoded_features(
                     raw_features_for_moco[0],
                     gt_bboxes_img_scale,
@@ -581,18 +594,16 @@ class DetectWithMoCoBK(DetectWithObjectMoCo):
         self.nc = nc
         self.hidden_dim = 2 * feature_dim
 
-        c_feat_map_for_roi = bk_ch[0]
-        feature_dim_2 = bk_ch[1]
-        self.dim_map = nn.Sequential(
-            nn.Conv2d(feature_dim_2, c_feat_map_for_roi, kernel_size=1, bias=False),
-            nn.BatchNorm2d(c_feat_map_for_roi),
-            nn.ReLU()
-        )
-        self.query_encoder = EncoderWithProjectorEA(c_feat_map_for_roi, self.feature_dim, self.hidden_dim)
-        self.key_encoder = EncoderWithProjectorEA(c_feat_map_for_roi, self.feature_dim, self.hidden_dim)
+        c_shallow = bk_ch[0]
+        c_deep = bk_ch[1]
+        self.query_encoder = EncoderWithProjectorEA(c_shallow, self.feature_dim, self.hidden_dim)
+        self.query_predictor = FeaturePredictor(self.feature_dim, self.hidden_dim)
+        self.deep_online_encoder = EncoderWithProjectorEA(c_deep, self.feature_dim, self.hidden_dim)
+        self.deep_online_predictor = FeaturePredictor(self.feature_dim, self.hidden_dim)
+        self.deep_momentum_encoder = EncoderWithProjectorEA(c_deep, self.feature_dim, self.hidden_dim)
 
-        self._copy_key_encoder_from_query()
-        for param_k in self.key_encoder.parameters():
+        self._copy_deep_momentum_from_online()
+        for param_k in self.deep_momentum_encoder.parameters():
             param_k.requires_grad = False
 
         self.register_buffer('queue', torch.randn(self.nc, self.queue_size, self.feature_dim))
@@ -601,6 +612,45 @@ class DetectWithMoCoBK(DetectWithObjectMoCo):
         self.register_buffer('queue_counts', torch.zeros(self.nc, dtype=torch.long))
         self.register_buffer('class_freq', torch.zeros(self.nc))
         self.total_samples = 0
+
+    @torch.no_grad()
+    def _copy_deep_momentum_from_online(self):
+        """Copy deep online encoder parameters and buffers to the deep momentum encoder."""
+        for param_q, param_k in zip(self.deep_online_encoder.parameters(), self.deep_momentum_encoder.parameters()):
+            param_k.data.copy_(param_q.data)
+        for buffer_q, buffer_k in zip(self.deep_online_encoder.buffers(), self.deep_momentum_encoder.buffers()):
+            buffer_k.data.copy_(buffer_q.data)
+
+    @torch.no_grad()
+    def _momentum_update_key_encoder(self):
+        """Momentum update the deep target encoder from the deep online encoder."""
+        for param_q, param_k in zip(self.deep_online_encoder.parameters(), self.deep_momentum_encoder.parameters()):
+            param_k.data.mul_(self.momentum).add_(param_q.data, alpha=1.0 - self.momentum)
+        for buffer_q, buffer_k in zip(self.deep_online_encoder.buffers(), self.deep_momentum_encoder.buffers()):
+            if torch.is_floating_point(buffer_k):
+                buffer_k.data.mul_(self.momentum).add_(buffer_q.data, alpha=1.0 - self.momentum)
+            else:
+                buffer_k.data.copy_(buffer_q.data)
+
+    @torch.no_grad()
+    def _extract_deep_momentum_roi_features(self,
+                                            feature_map: torch.Tensor,
+                                            bboxes_abs_img_scale: torch.Tensor,
+                                            batch_indices_for_roi: torch.Tensor,
+                                            current_batch_img_shapes: torch.Tensor):
+        """Extract deep target RoI features without updating momentum BatchNorm statistics."""
+        was_training = self.deep_momentum_encoder.training
+        self.deep_momentum_encoder.eval()
+        try:
+            return self._extract_roi_encoded_features(
+                feature_map,
+                bboxes_abs_img_scale,
+                batch_indices_for_roi,
+                current_batch_img_shapes,
+                self.deep_momentum_encoder
+            )
+        finally:
+            self.deep_momentum_encoder.train(was_training)
     
     def forward(self, x_pyramid_from_neck: List[torch.Tensor], batch: dict = None):
         """
@@ -628,6 +678,8 @@ class DetectWithMoCoBK(DetectWithObjectMoCo):
         moco_query_features = None
         moco_key_features = None
         moco_object_labels = None
+        moco_enqueue_features = None
+        moco_enqueue_labels = None
 
         if self.training and batch is not None and 'bboxes' in batch and 'cls' in batch and 'batch_idx' in batch:
             gt_bboxes_img_scale = batch['bboxes']  # Expected [N_total_gt, 4] (xyxy absolute on input image)
@@ -644,27 +696,39 @@ class DetectWithMoCoBK(DetectWithObjectMoCo):
                 #     current_batch_img_shapes_list.append(torch.tensor([h_img, w_img], device=batch['img'].device, dtype=torch.float))
                 # current_batch_img_shapes = torch.stack(current_batch_img_shapes_list)
 
-                # Extract Query Features
-                moco_query_features = self._extract_roi_encoded_features(
+                shallow_query_features = self._extract_roi_encoded_features(
                     raw_features_for_moco[0],
                     gt_bboxes_img_scale,
                     batch_indices_for_gt,
                     current_batch_img_shapes,
                     self.query_encoder
                 )
-                key_input_features = self.dim_map(raw_features_for_moco[1])  # Apply dim_map to the first feature map
-                # Extract Key Features (with no_grad context for key_encoder path)
+                shallow_query_features = self.query_predictor(shallow_query_features)
+
+                deep_feature_map = raw_features_for_moco[1].detach()
+                deep_online_features = self._extract_roi_encoded_features(
+                    deep_feature_map,
+                    gt_bboxes_img_scale,
+                    batch_indices_for_gt,
+                    current_batch_img_shapes,
+                    self.deep_online_encoder
+                )
+                deep_online_features = self.deep_online_predictor(deep_online_features)
+
                 with torch.no_grad():
-                    self._momentum_update_key_encoder()  # Update key encoder parameters
-                    moco_key_features = self._extract_key_roi_encoded_features(
-                        key_input_features,
+                    self._momentum_update_key_encoder()
+                    deep_momentum_features = self._extract_deep_momentum_roi_features(
+                        deep_feature_map,
                         gt_bboxes_img_scale,
                         batch_indices_for_gt,
                         current_batch_img_shapes
                     )
                 
-                moco_object_labels = gt_labels
-                #moco_object_labels = torch.cat([gt_labels, gt_labels], dim=0)
+                moco_query_features = torch.cat([shallow_query_features, deep_online_features], dim=0)
+                moco_key_features = torch.cat([deep_momentum_features, deep_momentum_features], dim=0)
+                moco_object_labels = torch.cat([gt_labels, gt_labels], dim=0)
+                moco_enqueue_features = deep_momentum_features
+                moco_enqueue_labels = gt_labels
 
         # --- Return appropriate outputs ---
         if self.training:
@@ -672,7 +736,8 @@ class DetectWithMoCoBK(DetectWithObjectMoCo):
             return (det_head_outputs, raw_features_for_moco, 
                     moco_query_features, moco_key_features, 
                     moco_object_labels, self.queue.clone().detach(),
-                    self.queue_counts.clone().detach()) # Pass a snapshot of the queue
+                    self.queue_counts.clone().detach(),
+                    moco_enqueue_features, moco_enqueue_labels) # Pass a snapshot of the queue
         else:
             # Standard inference path
             # self._inference processes det_head_outputs to final detections

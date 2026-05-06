@@ -1299,8 +1299,13 @@ class v8MoCoDetectionLoss(v8DetectionLoss):
             loss_items: 各项损失的详细信息。
         """
         # 解包预测值
-        if isinstance(preds, tuple) and len(preds) in {6, 7}:
-            if len(preds) == 7:
+        if isinstance(preds, tuple) and len(preds) in {6, 7, 9}:
+            enqueue_features = None
+            enqueue_labels = None
+            if len(preds) == 9:
+                (det_head_outputs, raw_features, query_features, key_features, object_labels,
+                 queue_snapshot, queue_counts, enqueue_features, enqueue_labels) = preds
+            elif len(preds) == 7:
                 det_head_outputs, raw_features, query_features, key_features, object_labels, queue_snapshot, queue_counts = preds
             else:
                 det_head_outputs, raw_features, query_features, key_features, object_labels, queue_snapshot = preds
@@ -1329,9 +1334,11 @@ class v8MoCoDetectionLoss(v8DetectionLoss):
 
             # 4. 返回损失和详细信息
             head = self.model.model[-1]
-            if key_features is not None and object_labels is not None and key_features.numel() > 0:
+            enqueue_features = key_features if enqueue_features is None else enqueue_features
+            enqueue_labels = object_labels if enqueue_labels is None else enqueue_labels
+            if enqueue_features is not None and enqueue_labels is not None and enqueue_features.numel() > 0:
                 with torch.no_grad():
-                    head._dequeue_and_enqueue(key_features.detach(), object_labels.detach())
+                    head._dequeue_and_enqueue(enqueue_features.detach(), enqueue_labels.detach())
 
             loss_items = torch.cat([det_loss_items, cl_loss.detach().unsqueeze(0)])
             return total_loss, loss_items
