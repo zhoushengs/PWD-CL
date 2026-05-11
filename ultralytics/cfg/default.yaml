@@ -97,6 +97,22 @@ warmup_bias_lr: 0.1 # (float) warmup initial bias lr
 box: 7.5 # (float) box loss gain
 cls: 0.5 # (float) cls loss gain (scale with pixels)
 dfl: 1.5 # (float) dfl loss gain
+hard_neg_mode: class_specific # (str) hard negative mining mode: class_specific or class_agnostic
+hard_neg_weight: 2.0 # (float) classification weight for mined hard negatives
+conf_threshold: 0.5 # (float) confidence threshold for hard negative mining
+topk_ratio: 0.1 # (float) ratio of background anchors selected as hard negatives
+hard_neg_class_id: 1 # (int) target class for class_specific hard negative mining
+manual_hard_neg_class_id: 0 # (int) auxiliary/manual negative class id
+manual_hard_neg_weight: 2.0 # (float) classification weight for manually marked hard-negative images
+notree_neg_weight: 1.5 # (float) classification weight for auxiliary notree negatives
+notree_conf_threshold: 0.5 # (float) confidence threshold for auxiliary notree negatives
+notree_topk_ratio: 0.1 # (float) ratio of background anchors selected as auxiliary notree negatives
+hard_neg_iou_threshold: 0.1 # (float) max IoU to target GT for mined hard negatives
+hard_neg_log_interval: 50 # (int) logging interval for hard negative mining stats
+hard_neg_vis_max_store: 32 # (int) max hard negative visualization samples to keep
+hard_neg_vis_per_batch: 2 # (int) max hard negative visualization samples collected per batch
+hard_neg_vis_samples: 16 # (int) max hard negative visualization samples exported
+buffer_size: 10000 # (int) max hard negative image ids stored in the replay buffer
 pose: 12.0 # (float) pose loss gain
 kobj: 1.0 # (float) keypoint obj loss gain
 nbs: 64 # (int) nominal batch size

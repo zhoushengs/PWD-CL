@@ -833,6 +833,10 @@ class v8DetectionLoss:
         self.hard_neg_weight = float(getattr(h, "hard_neg_weight", 2.0))
         self.conf_threshold = float(getattr(h, "conf_threshold", 0.5))
         self.topk_ratio = float(getattr(h, "topk_ratio", 0.1))
+        self.hard_neg_mode = str(getattr(h, "hard_neg_mode", "class_specific")).lower()
+        if self.hard_neg_mode not in {"class_specific", "class_agnostic"}:
+            LOGGER.warning(f"Unknown hard_neg_mode={self.hard_neg_mode}, falling back to class_specific.")
+            self.hard_neg_mode = "class_specific"
         self.manual_hard_neg_weight = float(getattr(h, "manual_hard_neg_weight", self.hard_neg_weight))
         self.hard_neg_class_id = int(getattr(h, "hard_neg_class_id", min(self.nc - 1, 1)))
         self.manual_hard_neg_class_id = int(getattr(h, "manual_hard_neg_class_id", 0))
@@ -929,7 +933,7 @@ class v8DetectionLoss:
         cls = cls.view(-1).to(self.device)
         batch_idx = batch_idx.view(-1).long().to(self.device)
         target_mask = torch.zeros(batch_size, dtype=torch.bool, device=self.device)
-        target_gt_mask = cls == self.hard_neg_class_id
+        target_gt_mask = torch.ones_like(cls, dtype=torch.bool) if self.hard_neg_mode == "class_agnostic" else cls == self.hard_neg_class_id
         if target_gt_mask.any():
             target_mask[batch_idx[target_gt_mask]] = True
         return target_mask
@@ -975,9 +979,11 @@ class v8DetectionLoss:
         if self.hard_neg_iou_threshold <= 0:
             return max_iou
 
-        target_label = gt_labels.new_tensor(float(self.hard_neg_class_id))
         for i in range(pred_boxes.shape[0]):
-            valid_gt = mask_gt[i, :, 0].bool() & (gt_labels[i, :, 0] == target_label)
+            valid_gt = mask_gt[i, :, 0].bool()
+            if self.hard_neg_mode == "class_specific":
+                target_label = gt_labels.new_tensor(float(self.hard_neg_class_id))
+                valid_gt &= gt_labels[i, :, 0] == target_label
             if not valid_gt.any():
                 continue
             target_gt_boxes = gt_boxes[i, valid_gt]
@@ -1181,17 +1187,25 @@ class v8DetectionLoss:
         # Cls loss
         # loss[1] = self.varifocal_loss(pred_scores, target_scores, target_labels) / target_scores_sum  # VFL way
         cls_loss = self.bce(pred_scores, target_scores.to(dtype))
-        sicktree_cls_loss = cls_loss[..., self.hard_neg_class_id].detach()
-        notree_cls_loss = cls_loss[..., self.manual_hard_neg_class_id].detach()
         bg_mask = ~fg_mask
         pred_scores_sigmoid = pred_scores.detach().sigmoid()
-        sicktree_conf = pred_scores_sigmoid[..., self.hard_neg_class_id]
-        notree_conf = pred_scores_sigmoid[..., self.manual_hard_neg_class_id]
-        conf_hard_neg_mask = bg_mask & sicktree_conf.gt(self.conf_threshold)
-        mined_topk_mask = self._select_topk_mask(sicktree_cls_loss, bg_mask)
+        if self.hard_neg_mode == "class_agnostic":
+            hard_neg_cls_loss, hard_neg_class_idx = cls_loss.detach().max(dim=-1)
+            hard_neg_conf, _ = pred_scores_sigmoid.max(dim=-1)
+            notree_cls_loss = cls_loss[..., self.manual_hard_neg_class_id].detach()
+            notree_conf = pred_scores_sigmoid[..., self.manual_hard_neg_class_id]
+        else:
+            hard_neg_cls_loss = cls_loss[..., self.hard_neg_class_id].detach()
+            hard_neg_conf = pred_scores_sigmoid[..., self.hard_neg_class_id]
+            hard_neg_class_idx = None
+            notree_cls_loss = cls_loss[..., self.manual_hard_neg_class_id].detach()
+            notree_conf = pred_scores_sigmoid[..., self.manual_hard_neg_class_id]
+        conf_hard_neg_mask = bg_mask & hard_neg_conf.gt(self.conf_threshold)
+        mined_topk_mask = self._select_topk_mask(hard_neg_cls_loss, bg_mask)
         hard_neg_mask = conf_hard_neg_mask | mined_topk_mask
-        notree_conf_mask = bg_mask & notree_conf.gt(self.notree_conf_threshold)
-        notree_topk_mask = self._select_topk_mask_with_ratio(notree_cls_loss, bg_mask, self.notree_topk_ratio)
+        notree_conf_mask = torch.zeros_like(bg_mask) if self.hard_neg_mode == "class_agnostic" else bg_mask & notree_conf.gt(self.notree_conf_threshold)
+        notree_ratio = 0.0 if self.hard_neg_mode == "class_agnostic" else self.notree_topk_ratio
+        notree_topk_mask = self._select_topk_mask_with_ratio(notree_cls_loss, bg_mask, notree_ratio)
         notree_neg_mask = (notree_conf_mask | notree_topk_mask) & ~hard_neg_mask
         pred_bboxes_img = pred_bboxes.detach() * stride_tensor
         max_iou_to_sicktree_gt = self._max_iou_to_target_gt(pred_bboxes_img, gt_bboxes, gt_labels, mask_gt)
@@ -1207,7 +1221,7 @@ class v8DetectionLoss:
         if self.model.training and self.buffer_size > 0:
             buffered_image_mask = self._buffer_image_mask(batch, batch_size)
             buffered_topk_mask = self._select_topk_mask(
-                sicktree_cls_loss, bg_mask & buffered_image_mask.unsqueeze(1) & low_iou_mask
+                hard_neg_cls_loss, bg_mask & buffered_image_mask.unsqueeze(1) & low_iou_mask
             )
         else:
             buffered_topk_mask = torch.zeros_like(bg_mask)
@@ -1215,12 +1229,18 @@ class v8DetectionLoss:
         cls_weight = torch.ones_like(cls_loss)
         if self.hard_neg_weight > 1:
             hard_neg_weight = cls_weight.new_full((), self.hard_neg_weight)
-            cls_weight[..., self.hard_neg_class_id] = torch.where(
-                hard_neg_mask, hard_neg_weight, cls_weight[..., self.hard_neg_class_id]
-            )
-            cls_weight[..., self.hard_neg_class_id] = torch.where(
-                buffered_topk_mask, hard_neg_weight, cls_weight[..., self.hard_neg_class_id]
-            )
+            if self.hard_neg_mode == "class_agnostic":
+                hard_neg_cls_mask = torch.zeros_like(cls_loss, dtype=torch.bool)
+                hard_neg_cls_mask.scatter_(2, hard_neg_class_idx.unsqueeze(-1), True)
+                hard_neg_cls_mask &= (hard_neg_mask | buffered_topk_mask).unsqueeze(-1)
+                cls_weight = torch.where(hard_neg_cls_mask, hard_neg_weight, cls_weight)
+            else:
+                cls_weight[..., self.hard_neg_class_id] = torch.where(
+                    hard_neg_mask, hard_neg_weight, cls_weight[..., self.hard_neg_class_id]
+                )
+                cls_weight[..., self.hard_neg_class_id] = torch.where(
+                    buffered_topk_mask, hard_neg_weight, cls_weight[..., self.hard_neg_class_id]
+                )
 
         if self.notree_neg_weight > 1:
             notree_weight = cls_weight.new_full((), self.notree_neg_weight)
@@ -1262,7 +1282,7 @@ class v8DetectionLoss:
             sample_tags[notree_neg_mask.cpu().numpy()] = "notree"
             sample_tags[hard_neg_mask.cpu().numpy()] = "sicktree_fp"
             self._collect_hard_negative_visuals(
-                batch, mined_mask, sicktree_conf, pred_bboxes, stride_tensor, sample_tags
+                batch, mined_mask, hard_neg_conf, pred_bboxes, stride_tensor, sample_tags
             )
             self._update_hard_negative_stats(
                 hard_neg_mask, notree_neg_mask, buffered_topk_mask, manual_hard_neg_image_mask
