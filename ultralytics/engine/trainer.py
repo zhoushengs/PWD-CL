@@ -234,6 +234,12 @@ class BaseTrainer:
         ckpt = self.setup_model()
         self.model = self.model.to(self.device)
         self.set_model_attributes()
+        m = self.model.model[-1] if hasattr(self.model, "model") else None
+        if hasattr(m, "configure_moco"):
+            m.configure_moco(
+                queue_size=getattr(self.args, "moco_queue_size", None),
+                roi_output_size=getattr(self.args, "moco_roi_output_size", None),
+            )
 
         # Freeze layers
         freeze_list = (

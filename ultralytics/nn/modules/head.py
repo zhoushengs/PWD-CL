@@ -341,6 +341,25 @@ class DetectWithObjectMoCo(Detect):
         self.total_samples = 0
     
     @torch.no_grad()
+    def configure_moco(self, queue_size=None, roi_output_size=None):
+        """Configure MoCo queue and RoIAlign size from YAML/train arguments."""
+        if roi_output_size is not None:
+            self.roi_output_size = int(roi_output_size)
+        if queue_size is None:
+            return
+
+        queue_size = int(queue_size)
+        if queue_size == self.queue_size:
+            return
+
+        device = self.queue.device
+        dtype = self.queue.dtype
+        self.queue_size = queue_size
+        self.queue = F.normalize(torch.randn(self.nc, self.queue_size, self.feature_dim, device=device, dtype=dtype), p=2, dim=2)
+        self.queue_ptr = torch.zeros(self.nc, dtype=torch.long, device=device)
+        self.queue_counts = torch.zeros(self.nc, dtype=torch.long, device=device)
+
+    @torch.no_grad()
     def _copy_key_encoder_from_query(self):
         """Copy query encoder parameters and buffers to the key encoder."""
         for param_q, param_k in zip(self.query_encoder.parameters(), self.key_encoder.parameters()):

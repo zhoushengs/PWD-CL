@@ -816,6 +816,11 @@ class v8DetectionLoss:
 
         self.model = model
         m = model.model[-1]  # Detect() module
+        if hasattr(m, "configure_moco"):
+            m.configure_moco(
+                queue_size=getattr(h, "moco_queue_size", None),
+                roi_output_size=getattr(h, "moco_roi_output_size", None),
+            )
         self.bce = nn.BCEWithLogitsLoss(reduction="none")
         self.hyp = h
         self.stride = m.stride  # model strides
