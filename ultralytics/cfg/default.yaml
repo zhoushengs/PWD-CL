@@ -108,6 +108,9 @@ notree_neg_weight: 1.5 # (float) classification weight for auxiliary notree nega
 notree_conf_threshold: 0.5 # (float) confidence threshold for auxiliary notree negatives
 notree_topk_ratio: 0.1 # (float) ratio of background anchors selected as auxiliary notree negatives
 hard_neg_iou_threshold: 0.1 # (float) max IoU to target GT for mined hard negatives
+mined_queue_size: 2048 # (int) FIFO feature capacity; zero disables mined contrastive negatives
+mined_queue_per_image: 8 # (int) maximum deduplicated mined keys per image
+mined_queue_weight: 1.0 # (float) additional denominator weight for target-class queries only
 hard_neg_log_interval: 50 # (int) logging interval for hard negative mining stats
 hard_neg_vis_max_store: 32 # (int) max hard negative visualization samples to keep
 hard_neg_vis_per_batch: 2 # (int) max hard negative visualization samples collected per batch

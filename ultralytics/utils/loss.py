@@ -8,7 +8,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchvision.ops import roi_align
+from torchvision.ops import roi_align, nms
 from ultralytics.utils.metrics import OKS_SIGMA
 from ultralytics.utils.ops import crop_mask, xywh2xyxy, xyxy2xywh
 from ultralytics.utils.tal import RotatedTaskAlignedAssigner, TaskAlignedAssigner, dist2bbox, dist2rbox, make_anchors
@@ -1221,6 +1221,10 @@ class v8DetectionLoss:
         manual_hard_neg_image_mask = self._manual_hard_neg_image_mask(batch, batch_size)
         positive_target_image_mask = self._positive_target_image_mask(batch, batch_size)
         mined_mask = hard_neg_mask | notree_neg_mask
+        if self.model.training and hasattr(self, "_capture_negative_rois"):
+            self._capture_negative_rois(
+                pred_bboxes_img, pred_scores_sigmoid, fg_mask, gt_bboxes, gt_labels, mask_gt, batch
+            )
         pure_hard_neg_image_mask = mined_mask.any(1) & ~positive_target_image_mask
 
         if self.model.training and self.buffer_size > 0:
@@ -1312,6 +1316,65 @@ class v8MoCoDetectionLoss(v8DetectionLoss):
         self.contrastive_loss_fn = nn.CrossEntropyLoss()  # 对比损失函数
         self.moco_start_epoch = int(getattr(self.hyp, "moco_start_epoch", 20))
         self.moco_ramp_epochs = max(int(getattr(self.hyp, "moco_ramp_epochs", 10)), 0)
+        self.mined_queue_size = int(getattr(self.hyp, "mined_queue_size", 2048))
+        self.mined_queue_per_image = int(getattr(self.hyp, "mined_queue_per_image", 8))
+        self.mined_queue_weight = float(getattr(self.hyp, "mined_queue_weight", 1.0))
+        if self.mined_queue_size < 0 or self.mined_queue_per_image < 0 or self.mined_queue_weight < 0:
+            raise ValueError("Mined queue size, sampling count and weight must be nonnegative")
+        self.mined_negative_queue = None
+        self._negative_rois = None
+
+    @torch.no_grad()
+    def _capture_negative_rois(self, boxes, scores, fg, gt_boxes, labels, valid, batch):
+        """Select bounded, deduplicated non-GT background regions for contrastive keys."""
+        self._negative_rois = None
+        if not self.mined_queue_size or not self.mined_queue_per_image:
+            return
+        height, width = batch["img"].shape[-2:]
+        rois, indices = [], []
+        for i in range(len(boxes)):
+            confidence = scores[i, :, self.hard_neg_class_id]
+            auxiliary = scores[i, :, self.manual_hard_neg_class_id]
+            candidate = (~fg[i]) & ((confidence > self.conf_threshold) | (auxiliary > self.notree_conf_threshold))
+            selected = candidate.nonzero().flatten()
+            rank_score = torch.maximum(confidence, auxiliary)
+            selected = selected[rank_score[selected].topk(min(256, len(selected))).indices]
+            b = boxes[i, selected].float().clone()
+            b[:, 0::2].clamp_(0, width)
+            b[:, 1::2].clamp_(0, height)
+            keep = torch.isfinite(b).all(1) & ((b[:, 2:] - b[:, :2]) >= 2).all(1)
+            gt = gt_boxes[i, valid[i, :, 0].bool() & (labels[i, :, 0] == self.hard_neg_class_id)].float()
+            for g in gt:
+                intersection = (torch.minimum(b[:, 2:], g[2:]) - torch.maximum(b[:, :2], g[:2])).clamp_min(0).prod(1)
+                area = (b[:, 2:] - b[:, :2]).clamp_min(0).prod(1)
+                union = area + (g[2:] - g[:2]).prod() - intersection
+                center = (b[:, :2] + b[:, 2:]) / 2
+                inside = ((center >= g[:2]) & (center <= g[2:])).all(1)
+                keep &= (intersection / union.clamp_min(1e-7) < self.hard_neg_iou_threshold)
+                keep &= (intersection / area.clamp_min(1e-7) < 0.5) & ~inside
+            b, s = b[keep], rank_score[selected][keep].float()
+            picked = nms(b, s, 0.5)[:self.mined_queue_per_image]
+            if len(picked):
+                rois.append(xyxy2xywh(b[picked]) / b.new_tensor([width, height, width, height]))
+                indices.append(torch.full((len(picked),), i, device=b.device, dtype=torch.long))
+        if rois:
+            self._negative_rois = (torch.cat(rois), torch.cat(indices))
+
+    @torch.no_grad()
+    def _encode_mined_negatives(self, features, batch):
+        """Reuse the head's key space without updating its momentum a second time."""
+        if self._negative_rois is None:
+            return None
+        boxes, indices = self._negative_rois
+        head = self.model.model[-1]
+        shape = boxes.new_tensor(batch["img"].shape[-2:])
+        if hasattr(head, "deep_momentum_encoder"):
+            keys = head._extract_deep_momentum_roi_features(features[1].detach(), boxes, indices, shape)
+        else:
+            keys = head._extract_key_roi_encoded_features(head.dim_map(features[1].detach()), boxes, indices, shape)
+        keys = keys.detach().float()
+        keys = keys[torch.isfinite(keys).all(1) & (keys.norm(dim=1) > 1e-8)]
+        return F.normalize(keys, dim=1)
 
     def __call__(self, preds, batch, epoch=None):
         """
@@ -1348,6 +1411,9 @@ class v8MoCoDetectionLoss(v8DetectionLoss):
                 elif self.moco_ramp_epochs > 0:
                     contrastive_scale = min((epoch - self.moco_start_epoch + 1) / self.moco_ramp_epochs, 1.0)
 
+            mined_keys = None
+            if self.model.training and contrastive_scale > 0 and self.mined_queue_weight > 0:
+                mined_keys = self._encode_mined_negatives(raw_features, batch)
             if contrastive_scale > 0 and query_features is not None and key_features is not None and object_labels is not None:
                 if query_features.shape[0] > 1:  # 至少需要两个对象特征
                     # 计算对比损失
@@ -1356,6 +1422,12 @@ class v8MoCoDetectionLoss(v8DetectionLoss):
 
             # 3. 合并损失
             total_loss = det_loss + self.contrastive_weight * cl_loss* contrastive_scale
+            if mined_keys is not None and mined_keys.numel():
+                previous = self.mined_negative_queue
+                self.mined_negative_queue = (
+                    mined_keys if previous is None else torch.cat((previous, mined_keys), dim=0)
+                )[-self.mined_queue_size:].clone().detach()
+            self._negative_rois = None
 
             # 4. 返回损失和详细信息
             head = self.model.model[-1]
@@ -1528,6 +1600,13 @@ class v8MoCoDetectionLoss(v8DetectionLoss):
             dim=1,
         )
         logits = logits.masked_fill(~valid_logit_mask, float("-inf"))
+        negatives = getattr(self, "mined_negative_queue", None)
+        if negatives is not None and negatives.numel() and self.mined_queue_weight > 0:
+            extra = q.float() @ negatives.detach().to(device).float().t() / temp
+            extra = extra + math.log(self.mined_queue_weight)
+            extra = extra.masked_fill(labels[:, None] != self.hard_neg_class_id, float("-inf"))
+            logits = torch.cat((logits.float(), extra), dim=1)
+            pos_mask = torch.cat((pos_mask, torch.zeros_like(extra)), dim=1)
         logits = logits - logits.max(dim=1, keepdim=True).values.detach()
         exp_logits = torch.exp(logits)
 
