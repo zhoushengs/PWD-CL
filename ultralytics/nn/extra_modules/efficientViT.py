@@ -1259,6 +1259,8 @@ class EfficientViTBlock(torch.nn.Module):
         if type == 's':
             self.mixer = Residual(LocalWindowAttention(ed, kd, nh, attn_ratio=ar, \
                     resolution=resolution, window_resolution=window_resolution, kernels=kernels))
+        else:
+            self.mixer = torch.nn.Identity()
                 
         self.dw1 = Residual(Conv2d_BN(ed, ed, 3, 1, 1, groups=ed, bn_weight_init=0., resolution=resolution))
         self.ffn1 = Residual(FFN(ed, int(ed * 2), resolution))
