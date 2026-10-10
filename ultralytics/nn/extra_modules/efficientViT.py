@@ -1377,11 +1377,13 @@ class EfficientViT(torch.nn.Module):
 EfficientViT_m0 = {
         'img_size': 224,
         'patch_size': 16,
+        'stages': ['c', 's', 's'],
         'embed_dim': [64, 128, 192],
         'depth': [1, 2, 3],
         'num_heads': [4, 4, 4],
         'window_size': [7, 7, 7],
         'kernels': [7, 5, 3, 3],
+        
     }
 
 EfficientViT_m1 = {
