@@ -1148,9 +1148,9 @@ class CascadedGroupAttention(torch.nn.Module):
             gate_i = head_gates[:, i:i + 1]
             if i > 0:
                 feat = feat + gate_i * feats_in[i]
-                if not self.training and gate_i.mean().item() < self.gate_threshold:
-                    feats_out.append(feat.new_zeros(B, self.d, H, W))
-                    continue
+                # if not self.training and gate_i.mean().item() < self.gate_threshold:
+                #     feats_out.append(feat.new_zeros(B, self.d, H, W))
+                #     continue
             feat = qkv(feat)
             q, k, v = feat.view(B, -1, H, W).split([self.key_dim, self.key_dim, self.d], dim=1)
             q = self.dws[i](q)
